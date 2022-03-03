@@ -1,0 +1,1385 @@
+---
+title: "Hurricane Analysis for AAMAS"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(brms)
+library(MASS)
+library(ggplot2)
+library(plyr)
+library(cowplot)
+library(dplyr)
+library(rlist)
+library(kableExtra)
+library(knitr)
+library(summarytools)
+library(corrplot)
+library(bayesplot)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Basis Analysis of Hurricane Experiment Data
+
+## Introduction 
+
+- AAMAS Data analysis 
+- Comparison between Real data and Simulation Results
+
+
+## Data Preprocessing 
+
+```{r echo=FALSE, include = FALSE}
+## Florida city to country (https://sites.google.com/site/centralfloridacycling/florida-counties-map)
+
+north_central_f_city <- c("Chattahoochee", "Greensboro", "Gretna", "Havana", "Midway", "Mount Pleasant", "Quincy",
+                          "Tallahassee", "Woodville","Crawfordville", "Medart", "Sopchoppy", "Smith Creek", "Saint Marks", 
+                          "Wakulla Beach", "Wakulla Springs","Capps", "Drifton", "Lamont", "Lloyd", "Monticello",
+                          "Wacissa","Greenville", "Lee", "Madison","Perry", "Steinhatchee","Jasper", "Jennings", 
+                          "Madison", "White Springs","Branford", "Dowling Park", "Live Oak", "McAlpin", "O Brien",
+                          "Three Rivers", "Wellborn", "Day", "Mayo", "Cross City", "Horseshoe Beach", "Old Town",
+                          "Fort White", "Lake City", "Lulu", "Watertown", "Lake Butler", "Raiford", 
+                          "Worthington Springs","Brooker", "Hampton", "Lawtey", "Starke","Trenton","Alachua", "Archer",
+                          "Gainesville", "Hawthorne", "High Springs", "La Crosse", "Micanopy", "Newberry", "Waldo",
+                          "Bronson", "Cedar Key", "Chiefland", "Fanning Springs", "Inglis", "Morriston", "Rosewood", 
+                          "Otter Creek", "Williston", "Yankeetown")
+northeast_f_city <- c("Baxter", "Cuyler", "Glen Saint Mary", "Macclenny", "Macedonia", "Margeretta", "Sanderson", "Taylor",
+                      "Amelia Island", "Bryceville", "Callahan", "Fernandina Beach", "Hilliard", "Yulee",
+                      "Atlantic Beach", "Baldwin", "Jacksonville", "Jacksonville Beach", "Mayport", "Neptune Beach",
+                      "Bellair", "Green Cove Springs", "Keystone Heights", "Middleburg", "Orange Park", "Penney Farms",
+                      "Crescent Beach", "Elkton", "Fort Matanzas", "Fruit Cove", "Hastings", "Marineland", "Palm Valley", 
+                      "Ponte Vedra", "Ponte Vedra Beach", "Saint Augustine", "Saint Augustine Beach", "Switzerland", 
+                      "Vilano Beach", "Crescent City", "East Palatka", "Florahome", "Fruitland", "Georgetown", 
+                      "Hollister", "Interlachen", "Lake Como", "Melrose", "Palatka", "Pomona Park", "San Mateo", 
+                      "Satsuma", "Welaka", "Beverly Beach", "Bunnell", "Flagler Beach", "Marineland", "Palm Coast",
+                      "Saint Johns")
+
+northwest_f_city <- c("Bellview", "Brent", "Brownsville", "Century", "Cantonment", "Ensley", "Gonzalez", "Molino",
+                      "Muscogee", "Myrtle Grove", "Pensacola", "Pensacola Beach", "Perdido Key", "Warrington", 
+                      "West Pensecola", "Avalon Beach", "Bagdad", "Gulf Breeze", "Jay", "Milton", "Munson", 
+                      "Navarre", "Pace,Baker", "Cinco Bayou", "Crestview", "Destin", "Fort Walton Beach", 
+                      "Laurel Hill", "Mary Esther", "Niceville", "Shalimar", "Valparaiso","DeFuniak Springs", 
+                      "Freeport", "Miramar Beach", "Paxton", "Point Washington", "Redbay", "Santa Rosa Beach",
+                      "Bonifay", "Esto", "Noma", "Ponce De Leon", "Westville","Caryville", "Chipley", "Ebro", "Greenhead", 
+                      "New Hope", "Sunny Hills", "Vernon", "Wausau", "Bayou George", "Bear Creek", "Callaway", 
+                      "Cedar Grove", "Fountain", "Hiland Park", "Laguna Beach", "Lynn Haven", "Mexico Beach", 
+                      "Millville", "Panama City", "Panama City Beach", "Parker", "Rosemary Beach", "Sand Hills", 
+                      "Sandy Creek", "Southport", "Springfield", "West Bay", "West Panama City Beach", "Youngstown",
+                      "Alford", "Bascom", "Campbelltown", "Cottondale", "Graceville", "Grand Ridge", "Greenwood", 
+                      "Jacob City", "Malone", "Marianna", "Sneads","Altha", "Blountstown","Bristol","Port Saint Joe",
+                      "Wewahitchka","Alligator Point", "Apalachicola", "Carrabelle", "Eastpoint","Fleming Island")
+
+southeast_f_city <- c("Arundel", "Indiantown", "Hobe Sound", "Hutchinson Island South", "Jensen Beach", 
+                      "Jupiter Island", "Ocean Breeze Park", "Palm City", "Sewalls Point", "Stuart", "Atlantis", 
+                      "Belle Glade", "Boca Raton", "Boynton Beach", "Briny Breezes", "Canal Point", "Cloud Lake", 
+                      "Delray Beach", "Glen Ridge", "Golf", "Greenacres", "Gulf Stream", "Haverhill", "Highland Beach", 
+                      "Hypoluxo", "Juno Beach", "Jupiter", "Jupiter Inlet Colony", "Lake Clarke Shores", "Lake Park", 
+                      "Lake Worth", "Lantana", "Loxahatchee", "Manalapan", "Mangonia Park", "North Palm Beach", 
+                      "Ocean Ridge", "Pahokee", "Palm Beach", "Palm Beach Gardens", "Palm Beach Shores", 
+                      "Palm Springs", "Riviera Beach", "Royal Palm Beach", "Sandcut", "South Bay", "South Palm Beach", 
+                      "Tequesta", "Wellington", "West Palm Beach", "Coconut Creek", "Cooper City", "Coral Springs", 
+                      "Dania Beach", "Davie", "Deerfield Beach", "Fort Lauderdale", "Hallandale Beach", "Hillsboro Beach",
+                      "Hollywood", "Lauderdale Lakes", "Lauderdale-By-The-Sea", "Lauderhill", "Lazy Lake", 
+                      "Lighthouse Point", "Margate", "Miramar", "North Lauderdale", "Oakland Park", "Parkland", 
+                      "Pembroke Park", "Pembroke Pines", "Plantation", "Pompano Beach", "Port Everglades", "Sea Ranch Lakes",
+                      "Southwest Ranches", "Sunrise", "Tamarac", "West Park", "Weston", "Wilton Manors","Aventura", 
+                      "Bal Harbour", "Bay Harbor Islands", "Biscayne Park", "Coconut Grove", "Coral Gables", "Cutler Bay", 
+                      "Doral", "El Portal", "Florida City", "Golden Beach", "Goulds", "Hialeah", "Hialeah Gardens", "Homestead",
+                      "Indian Village", "Islandia", "Kendall", "Key Biscayne", "Leisure City", "Medley", "Miami", 
+                      "Miami Beach", "Miami Gardens", "Miami Lakes", "Miami Shores Village", "Miami Springs",
+                      "North Bay Village", "North Miami", "North Miami Beach", "Opa Locka", "Palmetto Bay", 
+                      "Pinecrest", "Pinewood", "Princeton", "Richmond Heights", "South Miami", "Sunny Isles Beach", 
+                      "Surfside", "Sweetwater", "Virginia Gardens", "West Miami", "Westchester", "Westwood Lake", 
+                      "Big Pine", "Islamorada", "Key Colony Beach", "Key Largo", "Key West", "Layton", 
+                      "Marathon", "Sugarloaf Key", "Tavernier")
+
+southwest_f_city <- c("Cleveland", "Grove City", "Palm Island", "Placida", "Port Charlotte", "Punta Gorda", "Rotonda",
+                      "Solana","Buckeye Ridge", "Ortona", "Palmdale", "Lakeport"," Moore Haven","Alva", "Boca Grande", 
+                      "Bokeelia", "Bonita Springs", "Captiva", "Cape Coral", "Estero", "Fort Myers", 
+                      "Fort Myers Beach", "Fort Myers Shores", "Fort Myers Villas", "Gateway", "Lehigh Acres", 
+                      "North Fort Myers", "Page Park", "Pine Island Center", "Punta Rassa", "Sanibel", "San Carlos Park", 
+                      "Saint James City", "Tice", "Waterway Estates", "Clewiston", "Harlem", "La Belle", "Ave Maria", 
+                      "East Naples", "Everglades City", "Golden Gate", "Immokalee", "Marco", "Naples", "Naples Manor", 
+                      "Naples Park", "North Naples", "Ochopee", "Palm River Estates")
+
+central_f_city <- c( "Belleview", "Citra", "Dunnellon", "Eureka", "Fort McCoy", "McIntosh", "Ocala", 
+                     "Ocklawaha", "Orange Springs", "Reddick", "Romeo", "Salt Springs", "Summerfield", 
+                     "Weirsdale",  "Bushnell", "Center Hill", "Coleman", "Lake Panasoffkee", "Sumterville", 
+                     "Oxford", "The Villages", "Webster", "Wildwood","Altoona", "Astatula", "Astor", 
+                     "Bassville Park", "Clermont", "Eustis", "Forest Hills", "Fruitland Park", "Groveland", 
+                     "Howey-In-The-Hills", "Lady Lake", "Leesburg", "Mascotte", "Minneola", "Montverde", 
+                     "Mount Dora", "Mount Plymouth", "Okahumpka", "Paisley", "Sorrento", "Tavares", "Umatilla", 
+                     "Yalaha", "Altamonte Springs", "Casselberry", "Geneva", "Lake Mary", "Lake Monroe", "Longwood", 
+                     "Oviedo", "Sanford", "Winter Springs","Alafaya", "Apopka", "Bay Lake", "Belle Isle", 
+                     "Christmas", "Doctor Phillips", "Eatonville", "Edgewood", "Hunters Creek", "Lake Buena Vista", 
+                     "Maitland", "Oakland", "Ocoee", "Orlando", "Tangerine", "Windermere", "Winter Garden", 
+                     "Winter Park", "Zellwood", "Campbell", "Celebration", "Champions Gate", "Intercession City", 
+                     "Kenansville", "Kissimmee", "Poinciana", "Saint Cloud","Auburndale", "Bartow", "Davenport", 
+                     "Dundee", "Eagle Lake", "Fedhaven", "Fort Meade", "Frostproof", "Haines City", "Highland Park", 
+                     "Hillcrest Heights", "Indian Lake Estates", "Lake Alfred", "Lake Hamilton", "Lake Wales", 
+                     "Lakeland", "Mulberry", "Nalcrest", "Polk City", "Providence", "Winter Haven", "Bowling Green", 
+                     "Wauchula", "Zolfo Springs"," Avon Park", "Lake Placid"," Leisure Lakes", "Lorida", "Sebring", "Venus")
+
+central_east_f_city <- c("Daytona Beach"," Daytona Beach Shores", "Debary", "Deland", "Deltona", "Edgewater", 
+                         "Holly Hill", "Lake Helen", "New Smyrna Beach","Oak Hill", "Orange City", "Ormond Beach", 
+                         "Pierson"," Ponce Inlet", "Port Orange", "South Daytona","Barefoot Bay", 
+                         "Cape Canaveral", "Cocoa", "Cocoa Beach", "Grant", "Indialantic", "Indian Harbor Beach", 
+                         "Malabar", "Melbourne", "Melbourne Beach", "Melbourne Village", "Merritt Island", "Micco", 
+                         "Palm Bay", "Palm Shores", "Rockledge", "Satellite Beach", "Suntree", "Titusville", "Valkaria", 
+                         "Viera", "West Melbourne", "Fellsmere", "Indian River Shores", "Orchid", "Roseland", "Sebastian", 
+                         "Vero Beach","Cypress Quarters","Okeechobee","Fort Pierce", "Port Saint Lucie", "Saint Lucie Village")
+
+central_west_f_city  <- c("Beverly Hills", "Black Diamond", "Citrus Hills", "Citrus Springs", "Crystal River", 
+                          "Floral City", "Hernando", "Homosassa Springs", "Homosassa", "Inverness", "Lecanto", 
+                          "Pine Ridge", "Sugarmill Woods","Brooksville", "Herrnando Beach", "Masaryktown", "Ridge Manor", 
+                          "Spring Hill", "Weeki Wachee", "Bayonet Point", "Beacon Point", "Dade City", "Elfers", 
+                          "Gulf Harbors", "Holiday", "Hudson", "Lacoochee", "Land O Lakes", "New Port Richey", "Odessa", 
+                          "Port Richey", "San Antonio", "Shady Hills", "Saint Leo", "Trinity", "Wesley Chapel",
+                          "Zephyrhills", "Bay Pines", "Belleair", "Belleair Beach", "Belleair Bluffs", "Belleair Shore",
+                          "Boca Ciega", "Clearwater", "Crystal Beach", "Dunedin", "East Lake", "Gulfport",
+                          "Indian Rocks Beach", "Indian Shores", "Kenneth City", "Largo", "Madeira Beach", 
+                          "North Redington Beach", "Oldsmar", "Palm Harbor", "Pass-A-Grille Beach", "Pinellas Park", 
+                          "Redington Beach", "Redington Shores", "Safety Harbor", "Seminole", "South Pasadena", 
+                          "Saint Pete Beach", "Saint Petersburg", "Sunset Beach", "Tarpon Springs", "Tierra Verde", 
+                          "Treasure Island", "Ozona", "Apollo Beach", "Balm", "Bealsville", "Bloomingdale", "Brandon",
+                          "Carrollwood Village", "Dover", "Gibsonton", "Lithia", "Lutz", "Mango", "Orient Park", 
+                          "Plant City", "Riverview", "Ruskin", "Seffner", "Sun City Center", "Tampa", "Temple Terrace",
+                          "Thonotosassa", "Valrico", "Wimauma", "Ybor City", "Anna Maria", "Bradenton", "Bradenton Beach", 
+                          "Holmes Beach", "Longboat Key", "Myakka City", "Oneco", "Palmetto", "Nokomis", "Osprey", 
+                          "North Port", "Sarasota", "Venice", "Arcadia", "Brownville", "Cubitis", "Fort Ogden", "Hull", 
+                          "Lake Suzy", "Lansing", "Nocatee", "Southfort", "Pine Level", "Platt")
+
+gen_florida_area <- function(x)
+{
+  if(x %in% north_central_f_city) return("north central")
+  if(x %in% northeast_f_city) return("northeast")
+  if(x %in% northwest_f_city) return("northwest")
+  if(x %in% southwest_f_city) return("southwest")
+  if(x %in% southeast_f_city) return("southeast")
+  if(x %in% central_f_city)   return("central")
+  if(x %in% central_east_f_city) return("central east")
+  if(x %in% central_west_f_city) return("central west")
+  return(NA)
+}
+
+gen_florida_area_short <- function(x)
+{
+  if(x %in% north_central_f_city) return("north")
+  if(x %in% northeast_f_city) return("north")
+  if(x %in% northwest_f_city) return("north")
+  if(x %in% southwest_f_city) return("south")
+  if(x %in% southeast_f_city) return("south")
+  if(x %in% central_f_city)   return("central")
+  if(x %in% central_east_f_city) return("central")
+  if(x %in% central_west_f_city) return("central")
+  return(NA)
+}
+
+
+gen_florida_area_EWC <- function(x)
+{
+  if(x %in% north_central_f_city) return("central")
+  if(x %in% northeast_f_city) return("east")
+  if(x %in% northwest_f_city) return("west")
+  if(x %in% southwest_f_city) return("west")
+  if(x %in% southeast_f_city) return("east")
+  if(x %in% central_f_city)   return("central")
+  if(x %in% central_east_f_city) return("east")
+  if(x %in% central_west_f_city) return("west")
+  return(NA)
+}
+
+```
+
+
+```{r echo=FALSE, include=FALSE}
+## Cleaning up the data
+
+## Please contact nutjung.nutlc@gmail.com for the data
+
+dat_1 <- read_csv("Hurricane Survey Data/Pilot Hurricane Game - Template 16 (Final) - Cond 1_May 12, 2020_06.24.csv")
+dat_2 <- read_csv("Hurricane Survey Data/Pilot Hurricane Game - Template 16 (Final) - Cond 2_May 12, 2020_06.24.csv")
+
+dat_3 <- read_csv("Hurricane Survey Data/Pilot Hurricane Game - Template 16 (Final) - No decision - Cond 1_June 8, 2020_07.53.csv")
+dat_4 <- read_csv("Hurricane Survey Data/Pilot Hurricane Game - Template 16 (Final) - No decision - Cond2_June 8, 2020_07.53.csv")
+
+dat_1 <- dat_1[-c(1,2),]
+dat_2 <- dat_2[-c(1,2),]
+
+dat_3 <- dat_3[-c(1,2),]
+dat_4 <- dat_4[-c(1,2),]
+
+## Finish only
+dat_3 <- dat_3[which(dat_3$Finished=="True"),]
+dat_4 <- dat_4[which(dat_4$Finished == "True"),]
+
+## Assign Condition
+
+dat_1$outcome_cond <- dat_1$`Experiment Condition`
+dat_1$final_outcome <- "cat 4"
+dat_2$outcome_cond <- dat_2$`Experiment Condition`   
+dat_2$final_outcome <- "cat 2"
+
+dat_3$outcome_cond <- dat_3$`Experiment Condition`
+dat_3$final_outcome <- "cat 4"
+dat_4$outcome_cond <- dat_4$`Experiment Condition`
+dat_4$final_outcome <- "cat 2"
+
+## Decision 
+
+dat_1$decision_ver <- "decision"
+dat_2$decision_ver <- "decision"
+dat_3$decision_ver <- "no decision"
+dat_4$decision_ver <- "no decision"
+
+
+## New variables for decision ver.
+
+dat_1$Qmani1 <- NA
+dat_2$Qmani1 <- NA
+dat_1$Qmani2 <- NA
+dat_2$Qmani2 <- NA
+
+## New variables that aren't in no decision ver.
+
+dat_34 <- rbind(dat_3,dat_4)
+
+### Questionnaire
+
+dat_34$Q40_2 <- NA
+dat_34$Q40_3 <- NA
+dat_34$Q40_4 <- NA
+dat_34$`612_cond1_1` <- NA
+dat_34$`612_cond2_1` <- NA
+dat_34$Q31 <- NA
+dat_34$Q32 <- NA
+dat_34$Q4_1 <- NA
+dat_34$Q5_11 <- NA
+dat_34$Q8_11 <- NA
+
+### Imp and undesi questions
+
+dat_34$Q507_1 <- NA
+dat_34$Q507_2 <- NA
+dat_34$Q507_3 <- NA
+dat_34$Q507_4 <- NA
+
+dat_34$Q307_1 <- NA
+dat_34$Q307_2 <- NA
+dat_34$Q307_3 <- NA
+dat_34$Q307_4 <- NA
+
+dat_34$Q607_1 <- NA
+dat_34$Q607_2 <- NA
+dat_34$Q607_3 <- NA
+dat_34$Q607_4 <- NA
+
+dat_34$Q609_1 <- NA
+dat_34$Q610_1 <- NA
+dat_34$Q611_8 <- NA
+dat_34$Q608   <- NA
+
+### Decision points 
+
+dat_34$Q502      <- "No decision"
+dat_34$Q402_stay <- "No decision"
+dat_34$Q402_evac <- "No decision"
+dat_34$Q302_stay <- "No decision"
+dat_34$Q302_evac <- "No decision"
+dat_34$Q202_stay <- "No decision"
+dat_34$Q202_evac <- "No decision"
+dat_34$Q102_stay <- "No decision"
+dat_34$Q102_evac <- "No decision"
+dat_34$Q200_atten <- "${e://Field/EvacCost2day} per night"
+
+
+## Factor order  
+
+edu_order <- c("Some high school","High school graduate","Some college",
+               "College graduate","Graduate school")
+ 
+certain_order <- c("Not at all certain","Slightly certain",
+                   "Moderately certain","Very certain","Extremely certain")
+
+distance_order <- c("Within 1 mile","1 to 4 miles","4 to 10 miles",
+                    "10 to 30 miles","30 to 50 miles","More than 50 miles")
+
+saving_money_order <- c("Under $100","$100 - $500","$501 - $1000","$1001 - $5000","Over $5000")
+
+income_order <- c("Less than $20,000","$20,000 to $40,000","$40,000 to $60,000",
+                  "$60,000 to $80,000","$80,000 to $100,000","$100,000 to $150,000",
+                  "Over $150,000")
+
+flood_depth_order <- c("0 - 5 inches","6 - 11 inches","1 - 2 feet","3 - 4 feet","5 - 6 feet","7 feet or more")
+
+flood_dur_order <- c("1 day or less","2 - 3 days","4 - 7 days",
+                     "8 - 14 days","15 - 21 days","22 - 30 days","More than one month")
+has_evac_money_order <- c("No, I've never evacuated due to a hurricane.",
+                          "Yes, less than $100","Yes, $100 - $500","Yes. $501 - $1000","Yes, more than $1000")
+satisfied_order <- c("Extremely dissatisfied","Moderately dissatisfied","Slightly dissatisfied",
+                     "Neither satisfied nor dissatisfied","Slightly satisfied","Moderately satisfied","Extremely satisfied")
+
+cat_order <- c("A tropical storm","A category 1 hurricane", "A category 2 hurricane", 
+               "A category 3 hurricane", "A category 4 hurricane", "A category 5 hurricane" )
+
+num_vehicle_order <- c("None","One","More than one")
+
+## Main function for processing the data 
+
+gen_dat_clean <- function(temp_dat)
+{
+  dat <- data.frame(
+  
+    duration = as.numeric(temp_dat$`Duration (in seconds)`),
+    
+    ## Demo
+    age = as.numeric(temp_dat$Q11),
+    gender = temp_dat$Q12,
+    edu = factor(temp_dat$Q13, levels=edu_order),
+    income = factor(temp_dat$Q14, levels=income_order, ordered=T),
+    house_structure = temp_dat$Q15,
+    zip_code = temp_dat$Q16,
+    distance_to_coast = factor(temp_dat$Q17, levels = distance_order, ordered = T),
+    num_vehicle = factor(temp_dat$Q18, levels = num_vehicle_order, ordered = T),
+    has_pet = temp_dat$Q19,
+    num_family = as.numeric(temp_dat$Q20),
+    city = temp_dat$QCity_Q16,
+    state = temp_dat$QState_Q16,
+    saving_money = factor(temp_dat$Q25, levels = saving_money_order, ordered = T),
+    
+    ## Previous Experience
+    prev_hurricane_experience = temp_dat$Q21,
+    has_stuck_at_flood_home   = temp_dat$Q22,
+    has_experience_outage     = temp_dat$Q23,
+    has_evac_money            = factor(temp_dat$Q24, levels = has_evac_money_order, ordered = T),
+    evac_destination          = temp_dat$Q2, 
+    
+      cat4_undesirable = as.numeric(temp_dat$Q40_2),
+      cat3_undesirable = as.numeric(temp_dat$Q40_3),
+      cat2_undesirable = as.numeric(temp_dat$Q40_4),
+  
+      cat4_post  = as.numeric(temp_dat$`612_cond1_1`),
+      cat2_post  = as.numeric(temp_dat$`612_cond2_1`),
+    
+    ## expected_highest_cat = temp_dat$Q3,
+      prob_cat4 = as.numeric(temp_dat$Q4_1),
+      cat2_prob_life_threatening = as.numeric(temp_dat$Q5_11),
+      cat4_prob_life_threatening = as.numeric(temp_dat$Q8_11), 
+    cat2_flood_depth = factor(temp_dat$Q6, levels=flood_depth_order),
+    cat2_flood_dur = factor(temp_dat$Q7, levels =flood_dur_order),
+    cat2_certain   = factor(temp_dat$`Q5-7_var`, levels=certain_order),
+    cat4_flood_depth = factor(temp_dat$Q9, levels=flood_depth_order), 
+    cat4_flood_dur = factor(temp_dat$Q10, levels=flood_dur_order), 
+    cat4_certain   = factor(temp_dat$`Q8-10_var`, levels=certain_order),
+    
+    ##Main Experiment
+    
+    outcome_cond = temp_dat$outcome_cond,
+    final_outcome = temp_dat$final_outcome,
+    
+    Qattention = temp_dat$Qattention,
+    
+    ## 5th day
+    fifth_decision   = ifelse(temp_dat$Q502 == "Stay in my home","stay",
+                              ifelse(temp_dat$Q502 == "No decision","No decision","evac")),
+    
+    fifth_cat       = factor(temp_dat$Q503_1, levels= cat_order),
+    fifth_cat_prob  = as.numeric(temp_dat$Q503_2_4),
+    fifth_flood   = as.numeric(temp_dat$Q505),
+    fifth_outage     = as.numeric(temp_dat$Q504_1),
+       
+      fifth_physical_imp = as.numeric(temp_dat$Q507_1),
+      fifth_flooded_imp  = as.numeric(temp_dat$Q507_2),
+      fifth_outage_imp   = as.numeric(temp_dat$Q507_3),
+      fifth_evaccost_imp = as.numeric(temp_dat$Q507_4),
+    
+    ## 4th day
+    fourth_decision_stay = temp_dat$Q402_stay,
+    fourth_decision_evac = temp_dat$Q402_evac,
+    fourth_decision      = ifelse(temp_dat$Q402_stay == "Stay in my home" 
+                                  & !is.na(temp_dat$Q402_stay), "stay",
+                                  ifelse(temp_dat$Q502 == "No decision","No decision","evac")),
+    
+    fourth_decision_all  =  ifelse(temp_dat$Q502 == "No decision","No decision",
+                              ifelse(is.na(temp_dat$Q402_stay), "Already Evac",
+                                  ifelse(temp_dat$Q402_stay == "Stay in my home","stay","evac"))),
+    
+    
+    fourth_cat       = factor(temp_dat$Q403_1, levels = cat_order),
+    fourth_cat_prob = as.numeric(temp_dat$Q403_2_4),
+    fourth_flood  = as.numeric(temp_dat$Q405),
+    fourth_outage    = as.numeric(temp_dat$Q404_1),
+    
+    
+    ##3rd day
+    third_decision_stay = temp_dat$Q302_stay,
+    third_decision_evac = temp_dat$Q302_evac,
+    third_decision      = ifelse(temp_dat$Q302_stay == "Stay in my home" 
+                                 & !is.na(temp_dat$Q302_stay), "stay",
+                                 ifelse(temp_dat$Q502 == "No decision","No decision","evac")),
+    
+    third_decision_all  = ifelse(temp_dat$Q502 == "No decision","No decision",
+                            ifelse(is.na(temp_dat$Q302_stay), "Already Evac",
+                                  ifelse(temp_dat$Q302_stay == "Stay in my home","stay","evac"))),
+    
+    third_cat       = factor(temp_dat$Q303_1, levels = cat_order),
+    third_cat_prob = as.numeric(temp_dat$Q303_2_4),
+    third_flood  = as.numeric(temp_dat$Q305),
+    third_outage    = as.numeric(temp_dat$Q304_1),
+    
+      third_physical_imp = as.numeric(temp_dat$Q307_1),
+      third_flooded_imp  = as.numeric(temp_dat$Q307_2),
+      third_outage_imp   = as.numeric(temp_dat$Q307_3),
+      third_evaccost_imp = as.numeric(temp_dat$Q307_4),
+    
+    
+    ##2nd day
+    second_decision_stay = temp_dat$Q202_stay,
+    second_decision_evac = temp_dat$Q202_evac, 
+    second_decision      = ifelse(temp_dat$Q202_stay == "Stay in my home" 
+                                  & !is.na(temp_dat$Q202_stay), "stay",
+                                  ifelse(temp_dat$Q502 == "No decision","No decision","evac")),
+    
+    second_decision_all  = ifelse(temp_dat$Q502 == "No decision","No decision",
+                              ifelse(is.na(temp_dat$Q202_stay), "Already Evac",
+                                  ifelse(temp_dat$Q202_stay == "Stay in my home","stay","evac"))),
+    
+    second_cat        = factor(temp_dat$Q203_1, levels = cat_order),
+    second_cat_prob  = as.numeric(temp_dat$Q203_2_4),
+    second_flood   = as.numeric(temp_dat$Q205),
+    second_outage     = as.numeric(temp_dat$Q204_1),
+    second_attention  = temp_dat$Q200_atten,
+    
+    ##1st day
+    
+    first_decision_stay = temp_dat$Q102_stay,
+    first_decision_evac = temp_dat$Q102_evac,
+    first_decision      = ifelse(temp_dat$Q102_stay == "Stay in my home" 
+                                 & !is.na(temp_dat$Q102_stay), "stay",
+                                 ifelse(temp_dat$Q502 == "No decision","No decision","evac")),
+    
+    first_decision_all  = ifelse(temp_dat$Q502 == "No decision","No decision",
+                             ifelse(is.na(temp_dat$Q102_stay), "Already Evac",
+                                  ifelse(temp_dat$Q102_stay == "Stay in my home","stay","evac"))),
+    
+    first_cat       = factor(temp_dat$Q103_1, levels = cat_order),
+    first_cat_prob = as.numeric(temp_dat$Q103_2_4),
+    first_flood  = as.numeric(temp_dat$Q105),
+    first_outage    = as.numeric(temp_dat$Q104_1),
+    
+    ##Zero day
+    
+      satisfied_decision = factor(temp_dat$Q608, levels= satisfied_order, ordered = T),
+  
+      zero_physical_imp = as.numeric(temp_dat$Q607_1),
+      zero_flooded_imp  = as.numeric(temp_dat$Q607_2),
+      zero_outage_imp   = as.numeric(temp_dat$Q607_3),
+      zero_evaccost_imp = as.numeric(temp_dat$Q607_4),
+  
+      diff_undesi_flood  = as.numeric(temp_dat$Q609_1),
+      diff_undesi_outage = as.numeric(temp_dat$Q610_1),
+      diff_undesi_evaccost = as.numeric(temp_dat$Q611_8),
+  
+   ## After experiment 
+    
+      immersed   = temp_dat$Q31,
+      engaged    = temp_dat$Q32,
+    
+    intention = temp_dat$Qmani1,
+    feeling   = temp_dat$Qmani2,
+    decision_ver = temp_dat$decision_ver
+    
+  )
+  return(dat)
+}
+
+z_norm <- function(x)
+{
+  return( (x - mean(x, na.rm = TRUE))/sd(x, na.rm =TRUE) )
+}
+
+gen_z <- function(dat)
+{
+  ## Z-score
+dat$first_cat_expected2_z  <- z_norm(dat$first_cat_expected2)
+dat$second_cat_expected2_z <- z_norm(dat$second_cat_expected2)
+dat$third_cat_expected2_z  <- z_norm(dat$third_cat_expected2)
+dat$fourth_cat_expected2_z <- z_norm(dat$fourth_cat_expected2)
+dat$fifth_cat_expected2_z  <- z_norm(dat$fifth_cat_expected2)
+
+dat$first_cat_expected_z   <- z_norm(dat$first_cat_expected)
+dat$first_flood_z          <- z_norm(dat$first_flood)
+dat$first_outage_z         <- z_norm(dat$first_outage)
+
+dat$second_cat_expected_z  <- z_norm(dat$second_cat_expected)
+dat$second_flood_z         <- z_norm(dat$second_flood)
+dat$second_outage_z        <- z_norm(dat$second_outage)
+
+dat$third_cat_expected_z   <- z_norm(dat$third_cat_expected)
+dat$third_flood_z          <- z_norm(dat$third_flood)
+dat$third_outage_z         <- z_norm(dat$third_outage)
+
+dat$fourth_cat_expected_z  <- z_norm(dat$fourth_cat_expected)
+dat$fourth_flood_z         <- z_norm(dat$fourth_flood)
+dat$fourth_outage_z        <- z_norm(dat$fourth_outage)
+  
+dat$fifth_cat_expected_z   <- z_norm(dat$fifth_cat_expected)
+dat$fifth_flood_z          <- z_norm(dat$fifth_flood)
+dat$fifth_outage_z         <- z_norm(dat$fifth_outage)
+
+return(dat)
+}
+
+
+temp_dat <- rbind(gen_dat_clean(dat_1),
+                  gen_dat_clean(dat_2),
+                  gen_dat_clean(dat_34))
+
+dat <- temp_dat
+
+## Rare groups  ---------------------------------------------------------------------------------------------------
+
+dat$house_structure <- mapvalues(dat$house_structure, from=c("Other"),to=c("Detached single family house"))
+dat$prev_evac_decision <- ifelse(dat$prev_hurricane_experience == "No","Never experience",
+                            ifelse(dat$has_evac_money == "No, I've never evacuated due to a hurricane.",
+                                 "Never evac","Evac"))
+dat$prev_evac_decision2 <- ifelse(dat$has_evac_money == "No, I've never evacuated due to a hurricane.",
+                                 "Never evac","Evac")
+dat$prev_evac_decision3 <- ifelse(dat$prev_evac_decision == "Never evac","Never","Evac")
+
+
+dat$income <- mapvalues(dat$income, from =c("Over $150,000"), to=c("$100,000 to $150,000"))
+dat$income_n <- mapvalues(dat$income, from = c("Less than $20,000","$20,000 to $40,000","$40,000 to $60,000",
+                                               "$60,000 to $80,000","$80,000 to $100,000","$100,000 to $150,000"),
+                                      to = c("10","30","50","70","90","125"))
+dat$edu  <- mapvalues(dat$edu, from = c("Some high school"),to=c("High school graduate"))
+
+## New variables  ------------------------------------------------------------------------------------------------
+
+### when_evac  ---------------------------------------------------------------------------------------------------
+
+stay_word <- "Stay in my home"
+evac_word5 <- "Evacuate to the hotel, paying ${e://Field/EvacCost5day} per night"
+evac_word4 <- "Evacuate to the hotel, paying ${e://Field/EvacCost4day} per night."
+evac_word3 <- "Evacuate to the hotel, paying ${e://Field/EvacCost3day} per night."
+evac_word2 <- "Evacuate to the hotel, paying ${e://Field/EvacCost2day} per night."
+evac_word1 <- "Evacuate to the hotel, paying ${e://Field/EvacCost1day} per night."
+
+dat$when_evac <- ifelse(dat$fifth_decision == "evac" , "fifth_evac",
+                        ifelse(dat$fourth_decision_stay == evac_word4 , "fourth_evac",
+                               ifelse(dat$third_decision_stay == evac_word3 , "third_evac",
+                                      ifelse(dat$second_decision_stay == evac_word2, "second_evac",
+                                             ifelse(dat$first_decision_stay == evac_word1, "first_evac",
+                                                    ifelse(dat$first_decision_stay == "No decision","No decision","stay"))    
+                        ))))
+
+dat$when_evac <- factor(dat$when_evac, levels = c("fifth_evac","fourth_evac","third_evac","second_evac","first_evac","stay","No decision"))
+
+dat$evac54 <- ifelse(dat$when_evac == "fifth_evac" | dat$when_evac == "fourth_evac", "evac54","stay54")
+
+### Evac Order  ---------------------------------------------------------------------------------------------------
+
+evac_order <- c("evac","No decision","stay")
+
+dat$fifth_decision <- factor(dat$fifth_decision,levels = evac_order)
+dat$fourth_decision <- factor(dat$fourth_decision,levels = evac_order)
+dat$third_decision <- factor(dat$third_decision,levels = evac_order)
+dat$second_decision <- factor(dat$second_decision,levels = evac_order)
+dat$first_decision <- factor(dat$first_decision,levels = evac_order)
+
+dat$evac_decision <- dat$first_decision
+
+### Intention separated  -------------------------------------------------------------------------------------------
+
+dat$fifth_decision_intention <- ifelse(dat$fifth_decision == "No decision", as.character(dat$intention), as.character(dat$fifth_decision))
+dat$fourth_decision_intention <- ifelse(dat$fourth_decision == "No decision", as.character(dat$intention), as.character(dat$fourth_decision))
+dat$third_decision_intention <- ifelse(dat$third_decision == "No decision", as.character(dat$intention), as.character(dat$third_decision))
+dat$second_decision_intention <- ifelse(dat$second_decision == "No decision", as.character(dat$intention), as.character(dat$second_decision))
+dat$first_decision_intention <- ifelse(dat$first_decision == "No decision", as.character(dat$intention), as.character(dat$first_decision))
+
+dat$fifth_decision_all_intention <- ifelse(dat$fifth_decision == "No decision", as.character(dat$intention), as.character(dat$fifth_decision))
+dat$fourth_decision_all_intention <- ifelse(dat$fourth_decision_all == "No decision", as.character(dat$intention), as.character(dat$fourth_decision_all))
+dat$third_decision_all_intention <- ifelse(dat$third_decision_all == "No decision", as.character(dat$intention), as.character(dat$third_decision_all))
+dat$second_decision_all_intention <- ifelse(dat$second_decision_all == "No decision", as.character(dat$intention), as.character(dat$second_decision_all))
+dat$first_decision_all_intention <- ifelse(dat$first_decision_all == "No decision", as.character(dat$intention), as.character(dat$first_decision_all))
+
+
+### Decision&Condition  --------------------------------------------------------------------------------------------
+
+decision_order <- c("evac","no_decision","stay")
+dat$outcome_cond_fifth_decision  <- paste(dat$outcome_cond, dat$fifth_decision, sep="-")
+dat$outcome_cond_fourth_decision <- paste(dat$outcome_cond, dat$fourth_decision, sep="-")
+dat$outcome_cond_third_decision  <- paste(dat$outcome_cond, dat$third_decision, sep="-")
+dat$outcome_cond_second_decision <- paste(dat$outcome_cond, dat$second_decision, sep="-")
+dat$outcome_cond_first_decision  <- paste(dat$outcome_cond, dat$first_decision, sep="-")
+
+dat$outcome_cond_decision <- paste(dat$outcome_cond, dat$evac_decision, sep="-")
+
+dat$outcome_cond_intention <- paste(dat$outcome_cond,dat$intention,sep="-")
+dat$outcome_cond_feeling   <- paste(dat$outcome_cond,dat$feeling,sep="-")
+
+dat$final_outcome_decision <- paste(dat$final_outcome, dat$evac_decision, sep="-")
+
+### Satified   -----------------------------------------------------------------------------------------------------
+
+dat$satisfied_decision_num        <- as.numeric(dat$satisfied_decision)
+dat$satisfied_decision_group_num  <- ifelse(dat$satisfied_decision_num <=4, 4, dat$satisfied_decision_num)
+dat$satisfied_decision_group      <- factor(dat$satisfied_decision_group_num, ordered = T)
+dat$satisfied_decision_group2_num <- ifelse(dat$satisfied_decision_num <=5, 5, dat$satisfied_decision_num)
+dat$satisfied_decision_group2     <- factor(dat$satisfied_decision_group2, ordered = T)
+
+### Immersion  ----------------------------------------------------------------------------------------------------
+
+dat$immersed  <- as.character(dat$immersed)
+dat$engaged   <- as.character(dat$engaged)
+
+dat$immersed[which( grepl("Not at all", dat$immersed)) ]   <- "1"
+dat$immersed[which( grepl("Moderately", dat$immersed)) ]   <- "4"
+dat$immersed[which( grepl("Completely", dat$immersed)) ]   <- "7"
+
+dat$engaged[which( grepl("Not at all", dat$engaged)) ]     <- "1"
+dat$engaged[which( grepl("Moderately", dat$engaged)) ]     <- "4"
+dat$engaged[which( grepl("Completely", dat$engaged)) ]     <- "7"
+
+dat$immersed_num <- as.numeric(dat$immersed)
+dat$engaged_num  <- as.numeric(dat$engaged)
+
+### depth and dur to num  ------------------------------------------------------------------------------------------
+
+flood_depth_num   <- c(2.5,8.5,23.5,47.5,71.5,96)
+
+dat$cat2_flood_depth_num <- as.numeric(as.character(mapvalues( dat$cat2_flood_depth, from = flood_depth_order,
+                                       to = flood_depth_num)))
+dat$cat4_flood_depth_num <- as.numeric(as.character(mapvalues( dat$cat4_flood_depth, from = flood_depth_order,
+                                       to = flood_depth_num)))
+
+flood_dur_num   <- c(1, 2.5, 5.5, 11, 18, 26, 30)
+dat$cat2_flood_dur_num <- as.numeric(as.character(mapvalues( dat$cat2_flood_dur, from = flood_dur_order,
+                                       to = flood_dur_num)))
+dat$cat4_flood_dur_num <- as.numeric(as.character(mapvalues( dat$cat4_flood_dur, from = flood_dur_order,
+                                       to = flood_dur_num)))
+
+### Expected Cat Belief  -------------------------------------------------------------------------------------------
+
+cat_to_num <- function(x)
+{
+  if(x == "A tropical storm") return(0.5)
+  if(x == "A category 1 hurricane") return(1)
+  if(x == "A category 2 hurricane") return(2)
+  if(x == "A category 3 hurricane") return(3)
+  if(x == "A category 4 hurricane") return(4)
+  if(x == "A category 5 hurricane") return(5)
+  return(-1)
+}
+
+cat_to_num2 <- function(x)
+{
+  if(x == "A tropical storm") return(0.5)
+  if(x == "A category 1 hurricane") return(1)
+  if(x == "A category 2 hurricane") return(4)
+  if(x == "A category 3 hurricane") return(9)
+  if(x == "A category 4 hurricane") return(16)
+  if(x == "A category 5 hurricane") return(25)
+  return(-1)
+}
+
+dat$fifth_cat_num   <- sapply(dat$fifth_cat, cat_to_num)
+dat$fourth_cat_num  <- sapply(dat$fourth_cat, cat_to_num)
+dat$third_cat_num   <- sapply(dat$third_cat, cat_to_num)
+dat$second_cat_num  <- sapply(dat$second_cat, cat_to_num)
+dat$first_cat_num   <- sapply(dat$first_cat, cat_to_num)
+
+dat$fifth_cat_expected  <- dat$fifth_cat_num*dat$fifth_cat_prob/100
+dat$fourth_cat_expected <- dat$fourth_cat_num*dat$fourth_cat_prob/100
+dat$third_cat_expected  <- dat$third_cat_num*dat$third_cat_prob/100
+dat$second_cat_expected <- dat$second_cat_num*dat$second_cat_prob/100
+dat$first_cat_expected  <- dat$first_cat_num*dat$first_cat_prob/100
+
+dat$fifth_cat_num2   <- sapply(dat$fifth_cat, cat_to_num2)
+dat$fourth_cat_num2  <- sapply(dat$fourth_cat, cat_to_num2)
+dat$third_cat_num2   <- sapply(dat$third_cat, cat_to_num2)
+dat$second_cat_num2  <- sapply(dat$second_cat, cat_to_num2)
+dat$first_cat_num2   <- sapply(dat$first_cat, cat_to_num2)
+
+dat$fifth_cat_expected2  <- dat$fifth_cat_num2*dat$fifth_cat_prob/100
+dat$fourth_cat_expected2 <- dat$fourth_cat_num2*dat$fourth_cat_prob/100
+dat$third_cat_expected2  <- dat$third_cat_num2*dat$third_cat_prob/100
+dat$second_cat_expected2 <- dat$second_cat_num2*dat$second_cat_prob/100
+dat$first_cat_expected2  <- dat$first_cat_num2*dat$first_cat_prob/100
+
+dat$fifth_cat_prob_low  <- ifelse(dat$fifth_cat_prob < 17, "Low","Normal")
+dat$fourth_cat_prob_low <- ifelse(dat$fourth_cat_prob < 17, "Low","Normal")
+dat$third_cat_prob_low  <- ifelse(dat$third_cat_prob < 17, "Low","Normal")
+dat$second_cat_prob_low <- ifelse(dat$second_cat_prob < 17, "Low","Normal")
+dat$first_cat_prob_low  <- ifelse(dat$first_cat_prob < 17, "Low","Normal")
+
+
+### Log transform  ------------------------------------------------------------------------------------------------
+
+dat$first_flood_log <- log1p(dat$first_flood)
+dat$first_outage_log <- log1p(dat$first_outage)
+dat$first_cat_expected_log <- log1p(dat$first_cat_expected)
+
+dat$second_flood_log <- log1p(dat$second_flood)
+dat$second_outage_log <- log1p(dat$second_outage)
+dat$second_cat_expected_log <- log1p(dat$second_cat_expected)
+
+dat$third_flood_log <- log1p(dat$third_flood)
+dat$third_outage_log <- log1p(dat$third_outage)
+dat$third_cat_expected_log <- log1p(dat$third_cat_expected)
+
+dat$fourth_flood_log <- log1p(dat$fourth_flood)
+dat$fourth_outage_log <- log1p(dat$fourth_outage)
+dat$fourth_cat_expected_log <- log1p(dat$fourth_cat_expected)
+
+dat$fifth_flood_log <- log1p(dat$fifth_flood)
+dat$fifth_outage_log <- log1p(dat$fifth_outage)
+dat$fifth_cat_expected_log <- log1p(dat$fifth_cat_expected)
+
+dat$first_cat_expected2_log  <- log1p(dat$first_cat_expected2)
+dat$second_cat_expected2_log <- log1p(dat$second_cat_expected2)
+dat$third_cat_expected2_log  <- log1p(dat$third_cat_expected2)
+dat$fourth_cat_expected2_log <- log1p(dat$fourth_cat_expected2)
+dat$fifth_cat_expected2_log  <- log1p(dat$fifth_cat_expected2)
+
+
+dat$fifth_physical_imp_log <- log1p(dat$fifth_physical_imp)
+dat$fifth_flooded_imp_log <- log1p(dat$fifth_flooded_imp)
+dat$fifth_outage_imp_log <- log1p(dat$fifth_outage_imp)
+dat$fifth_evaccost_imp_log <- log1p(dat$fifth_evaccost_imp)
+
+dat$third_physical_imp_log <- log1p(dat$third_physical_imp)
+dat$third_flooded_imp_log <- log1p(dat$third_flooded_imp)
+dat$third_outage_imp_log <- log1p(dat$third_outage_imp)
+dat$third_evaccost_imp_log <- log1p(dat$third_evaccost_imp)
+
+dat$zero_physical_imp_log <- log1p(dat$zero_physical_imp)
+dat$zero_flooded_imp_log <- log1p(dat$zero_flooded_imp)
+dat$zero_outage_imp_log <- log1p(dat$zero_outage_imp)
+dat$zero_evaccost_imp_log <- log1p(dat$zero_evaccost_imp)
+
+
+dat$prob_cat4_log <- log1p(dat$prob_cat4)
+dat$cat4_post_log <- log1p(dat$cat4_post)
+dat$cat4_prob_life_threatening_log <- log1p(dat$cat4_prob_life_threatening)
+dat$cat2_prob_life_threatening_log <- log1p(dat$cat2_prob_life_threatening)
+dat$cat2_flood_depth_num_log <- log(dat$cat2_flood_depth_num)
+dat$cat4_flood_depth_num_log <- log(dat$cat4_flood_depth_num)
+dat$cat2_flood_dur_num_log <- log(dat$cat2_flood_dur_num)
+dat$cat4_flood_dur_num_log <- log(dat$cat4_flood_dur_num)
+
+
+dat$duration_log <- log(dat$duration)
+dat$age_log <- log(dat$age)
+
+### Others: Grouping, etc.  -------------------------------------------------------------------------------------
+
+dat$age_group <- ifelse(dat$age < 30, "1",
+                             ifelse(dat$age < 45,"2",
+                                    ifelse(dat$age < 60, "3","4")))
+dat$family_group <- ifelse(dat$num_family >= 5, "5",as.character(dat$num_family))
+
+dat$second_attention_correct <- ifelse(dat$second_attention == "${e://Field/EvacCost2day} per night",1,0)
+
+dat$decision_intention <- ifelse(dat$intention == "Yes - to evacuate","int-evac",
+                                 ifelse(dat$intention == "Yes - to shelter in my home","int-stay",
+                                        ifelse(dat$intention == "No", "no-int", 
+                                               ifelse(dat$evac_decision == "stay","stay","evac"))))
+
+dat$intention <- mapvalues(dat$intention, from = c("Yes - to evacuate","Yes - to shelter in my home"),
+                                          to   = c("to_evac","to_stay"))
+
+dat$florida_area       <- sapply(dat$city, gen_florida_area)
+dat$florida_area_short <- sapply(dat$city, gen_florida_area_short)
+dat$florida_area_EWC   <- sapply(dat$city, gen_florida_area_EWC)
+
+### Difference of Importance  ------------------------------------------------------------------------------------
+
+dat$diff05_physical_imp <- dat$zero_physical_imp - dat$fifth_physical_imp 
+dat$diff05_flooded_imp  <- dat$zero_flooded_imp  - dat$fifth_flooded_imp
+dat$diff05_outage_imp   <- dat$zero_outage_imp   - dat$fifth_outage_imp  
+dat$diff05_evaccost_imp <- dat$zero_evaccost_imp - dat$fifth_evaccost_imp
+
+dat$diff35_physical_imp <- dat$third_physical_imp - dat$fifth_physical_imp 
+dat$diff35_flooded_imp  <- dat$third_flooded_imp  - dat$fifth_flooded_imp
+dat$diff35_outage_imp   <- dat$third_outage_imp   - dat$fifth_outage_imp  
+dat$diff35_evaccost_imp <- dat$third_evaccost_imp - dat$fifth_evaccost_imp
+
+dat$diff03_physical_imp <- dat$zero_physical_imp - dat$third_physical_imp 
+dat$diff03_flooded_imp  <- dat$zero_flooded_imp  - dat$third_flooded_imp
+dat$diff03_outage_imp   <- dat$zero_outage_imp   - dat$third_outage_imp  
+dat$diff03_evaccost_imp <- dat$zero_evaccost_imp - dat$third_evaccost_imp
+
+gen_sign <- function(x, approx_zero_range = 0)
+{
+  temp <- ifelse(x > approx_zero_range, "pos", 
+                 ifelse(x < approx_zero_range, "neg","zero"))
+  return(temp)
+}
+
+dat$diff05_physical_imp_sign0 <- gen_sign(dat$diff05_physical_imp,0)
+dat$diff05_flooded_imp_sign0  <- gen_sign(dat$diff05_flooded_imp,0)
+dat$diff05_outage_imp_sign0   <- gen_sign(dat$diff05_outage_imp,0)
+dat$diff05_evaccost_imp_sign0 <- gen_sign(dat$diff05_evaccost_imp,0)
+
+dat$diff05_physical_imp_sign1 <- gen_sign(dat$diff05_physical_imp,1)
+dat$diff05_flooded_imp_sign1  <- gen_sign(dat$diff05_flooded_imp,1)
+dat$diff05_outage_imp_sign1   <- gen_sign(dat$diff05_outage_imp,1)
+dat$diff05_evaccost_imp_sign1 <- gen_sign(dat$diff05_evaccost_imp,1)
+
+dat$diff05_physical_imp_sign2 <- gen_sign(dat$diff05_physical_imp,2)
+dat$diff05_flooded_imp_sign2  <- gen_sign(dat$diff05_flooded_imp,2)
+dat$diff05_outage_imp_sign2   <- gen_sign(dat$diff05_outage_imp,2)
+dat$diff05_evaccost_imp_sign2 <- gen_sign(dat$diff05_evaccost_imp,2)
+
+dat$diff03_physical_imp_sign0 <- gen_sign(dat$diff03_physical_imp,0)
+dat$diff03_flooded_imp_sign0  <- gen_sign(dat$diff03_flooded_imp,0)
+dat$diff03_outage_imp_sign0   <- gen_sign(dat$diff03_outage_imp,0)
+dat$diff03_evaccost_imp_sign0 <- gen_sign(dat$diff03_evaccost_imp,0)
+
+dat$diff03_physical_imp_sign1 <- gen_sign(dat$diff03_physical_imp,1)
+dat$diff03_flooded_imp_sign1  <- gen_sign(dat$diff03_flooded_imp,1)
+dat$diff03_outage_imp_sign1   <- gen_sign(dat$diff03_outage_imp,1)
+dat$diff03_evaccost_imp_sign1 <- gen_sign(dat$diff03_evaccost_imp,1)
+
+dat$diff03_physical_imp_sign2 <- gen_sign(dat$diff03_physical_imp,2)
+dat$diff03_flooded_imp_sign2  <- gen_sign(dat$diff03_flooded_imp,2)
+dat$diff03_outage_imp_sign2   <- gen_sign(dat$diff03_outage_imp,2)
+dat$diff03_evaccost_imp_sign2 <- gen_sign(dat$diff03_evaccost_imp,2)
+
+dat$diff35_physical_imp_sign0 <- gen_sign(dat$diff35_physical_imp,0)
+dat$diff35_flooded_imp_sign0  <- gen_sign(dat$diff35_flooded_imp,0)
+dat$diff35_outage_imp_sign0   <- gen_sign(dat$diff35_outage_imp,0)
+dat$diff35_evaccost_imp_sign0 <- gen_sign(dat$diff35_evaccost_imp,0)
+
+dat$diff35_physical_imp_sign1 <- gen_sign(dat$diff35_physical_imp,1)
+dat$diff35_flooded_imp_sign1  <- gen_sign(dat$diff35_flooded_imp,1)
+dat$diff35_outage_imp_sign1   <- gen_sign(dat$diff35_outage_imp,1)
+dat$diff35_evaccost_imp_sign1 <- gen_sign(dat$diff35_evaccost_imp,1)
+
+dat$diff35_physical_imp_sign2 <- gen_sign(dat$diff35_physical_imp,2)
+dat$diff35_flooded_imp_sign2  <- gen_sign(dat$diff35_flooded_imp,2)
+dat$diff35_outage_imp_sign2   <- gen_sign(dat$diff35_outage_imp,2)
+dat$diff35_evaccost_imp_sign2 <- gen_sign(dat$diff35_evaccost_imp,2)
+
+### Change in beliefs  ----------------------------------------------------------------------------------------------
+
+dat$diff_cat4_unde <- dat$cat4_post - dat$cat4_undesirable
+dat$diff_cat2_unde <- dat$cat2_post - dat$cat2_undesirable
+
+dat$diff_cat4_unde_pos <- ifelse(dat$diff_cat4_unde > 0, 1,0)
+dat$diff_cat2_unde_pos <- ifelse(dat$diff_cat2_unde > 0, 1,0)
+
+dat$diff_cat4_unde_neg <- ifelse(dat$diff_cat4_unde < 0, 1,0)
+dat$diff_cat2_unde_neg <- ifelse(dat$diff_cat2_unde < 0, 1,0)
+
+dat$diff_cat4_unde_sign <- ifelse(dat$diff_cat4_unde == 0,"zero",
+                                     ifelse(dat$diff_cat4_unde >0,"pos","neg"))
+dat$diff_cat2_unde_sign <- ifelse(dat$diff_cat2_unde == 0,"zero",
+                                     ifelse(dat$diff_cat2_unde >0,"pos","neg"))
+
+dat$diff_undesi_flood_pos <- ifelse(dat$diff_undesi_flood > 0,1,0)
+dat$diff_undesi_outage_pos <- ifelse(dat$diff_undesi_outage > 0,1,0)
+dat$diff_undesi_evaccost_pos <- ifelse(dat$diff_undesi_evaccost > 0,1,0)
+
+dat$diff_undesi_flood_sign <- ifelse(dat$diff_undesi_flood == 0,"zero",
+                                     ifelse(dat$diff_undesi_flood >0,"pos","neg"))
+dat$diff_undesi_outage_sign <- ifelse(dat$diff_undesi_outage == 0,"zero",
+                                     ifelse(dat$diff_undesi_outage >0,"pos","neg"))
+dat$diff_undesi_evaccost_sign <- ifelse(dat$diff_undesi_evaccost == 0,"zero",
+                                     ifelse(dat$diff_undesi_evaccost >0,"pos","neg"))
+
+### New variables for fitting/predicting the decision and beliefs  ------------------------------------------------------------
+
+dat$second_decision_num <-  ifelse(dat$second_decision == "evac",1,0)
+dat$third_decision_num  <-  ifelse(dat$third_decision == "evac",1,0)
+dat$early_evac <- ifelse(dat$when_evac == "fifth_evac" | dat$when_evac == "fourth_evac" | dat$when_evac == "third_evac",1,0)
+dat$early_evac_no_fifth <- ifelse(dat$when_evac == "fourth_evac" | dat$when_evac == "third_evac",1,0)
+dat$evac_decision_num <- ifelse(dat$evac_decision == 'evac',1,0)
+
+dat$fifth_combined_imp <- (dat$fifth_physical_imp + dat$fifth_flooded_imp + dat$fifth_outage_imp)/3
+dat$third_combined_imp <- (dat$third_physical_imp + dat$third_flooded_imp + dat$third_outage_imp)/3
+dat$zero_combined_imp  <- (dat$zero_physical_imp  + dat$zero_flooded_imp  + dat$zero_outage_imp)/3
+
+## Exclusion ----------------------------------------------------------------------------------------------------------------
+
+
+exclusion_non_FL <- which(dat$state != "FL")
+
+exclusion_0 <- which(dat$age > 100 | dat$age < 18 | 
+                     dat$num_family > 12 | dat$Qattention != "Yes" | is.na(dat$city) | 
+                     is.na(dat$first_flood))
+
+exclusion_05 <- which(dat$age > 100 | dat$age < 18 | 
+                     dat$num_family > 12 | dat$Qattention != "Yes" | is.na(dat$city) | 
+                     dat$state != "FL" | 
+                     dat$fifth_flood > 108 | dat$fourth_flood > 108 | dat$third_flood > 108 |
+                     dat$second_flood > 108 | dat$first_flood > 108 
+                     | is.na(dat$first_flood))
+
+exclusion <- which( dat$age > 100| dat$age < 18 |
+                      dat$num_family > 12 | dat$Qattention != "Yes" | is.na(dat$city) | 
+                      dat$state != "FL" |
+                      dat$second_attention != "${e://Field/EvacCost2day} per night"|
+                      dat$fifth_flood > 108 | dat$fourth_flood > 108 | dat$third_flood > 108 |
+                      dat$second_flood > 108 | dat$first_flood > 108
+                      | is.na(dat$first_flood))
+
+
+exclude_fifth_evac <- which(dat$fifth_decision == "evac")
+
+exclude_no_intention <- which(dat$intention == "No")
+
+dat_exclude_non_FL       <- gen_z(dat[-exclusion_non_FL,])
+
+dat_exclude              <- gen_z(dat[-exclusion,])
+
+dat_exclude_no_intention <- gen_z(dat[-union(exclusion,exclude_no_intention),])
+
+dat_exclude_0            <- gen_z(dat[-exclusion_0,])
+
+dat_exclude_05           <- gen_z(dat[-exclusion_05,])
+
+dat_exclude_058          <- gen_z(dat[-union(exclusion_05,exclude_fifth_evac),])
+
+### There used to be other combination but are deemed unimportant.
+
+dat_exclude8             <- gen_z(dat[-union(exclusion, exclude_fifth_evac), ]) 
+
+
+dat$excluded <- "No"
+dat$excluded[exclusion] <- "Yes"
+
+dat <- gen_z(dat)
+
+### Separate data based on condition ---------------------------------------------------------------------
+
+dat_cond1 <- gen_z(dat[which(dat$outcome_cond == "1"),])
+dat_cond2 <- gen_z(dat[which(dat$outcome_cond == "2"),])
+
+dat_cond1_exc_0 <- gen_z(dat_exclude_0[which(dat_exclude_0$outcome_cond == "1"),])
+dat_cond2_exc_0 <- gen_z(dat_exclude_0[which(dat_exclude_0$outcome_cond == "2"),])
+
+dat_cond1_exc_05 <- gen_z(dat_exclude_05[which(dat_exclude_05$outcome_cond == "1"),])
+dat_cond2_exc_05 <- gen_z(dat_exclude_05[which(dat_exclude_05$outcome_cond == "2"),])
+
+dat_cond1_exc <- gen_z(dat_exclude[which(dat_exclude$outcome_cond == "1"),])
+dat_cond2_exc <- gen_z(dat_exclude[which(dat_exclude$outcome_cond == "2"),])
+
+dat_cond1_exc8 <- gen_z(dat_exclude8[which(dat_exclude8$outcome_cond == "1"),])
+dat_cond2_exc8 <- gen_z(dat_exclude8[which(dat_exclude8$outcome_cond == "2"),])
+
+
+```
+
+
+## Data Analyis 
+
+```{r echo = FALSE}
+
+## Pick dat_exclude and only decision ver
+dim(dat[dat$evac_decision != "No decision",])
+
+dim(dat_exclude[dat_exclude$evac_decision != "No decision",])
+
+df <- dat_exclude[dat_exclude$evac_decision != "No decision",]
+
+### Fourth Days Before the Storm
+m4_cat <- brm(bf(fourth_cat_expected ~ fourth_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience,
+                sigma ~ fourth_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m4_cat_aamas")
+h_m4_cat <- hypothesis(m4_cat, "fourth_decisionstay < 0")
+
+m4_flood <- brm(bf(fourth_flood ~ fourth_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience,
+                sigma ~ fourth_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m4_flood_aamas")
+h_m4_flood <- hypothesis(m4_flood, "fourth_decisionstay < 0")
+
+
+m4_outage <- brm(bf(fourth_outage ~ fourth_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience,
+                sigma ~ fourth_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m4_outage_aamas")
+h_m4_outage <- hypothesis(m4_outage, "fourth_decisionstay < 0")
+
+
+### Third day before the storm
+
+m3_cat <- brm(bf(third_cat_expected ~ third_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience,
+                sigma ~ third_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m3_cat_aamas")
+h_m3_cat <- hypothesis(m3_cat, "third_decisionstay < 0")
+
+m3_flood <- brm(bf(third_flood ~ third_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience,
+                sigma ~ third_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m3_flood_aamas")
+h_m3_flood <- hypothesis(m3_flood, "third_decisionstay < 0")
+
+
+m3_outage <- brm(bf(third_outage ~ third_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience,
+                sigma ~ third_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m3_outage_aamas")
+h_m3_outage <- hypothesis(m3_outage, "third_decisionstay < 0")
+
+### Second day before the storm
+
+m2_cat <- brm(bf(second_cat_expected ~ second_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience + outcome_cond,
+                sigma ~ second_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m2_cat_aamas")
+h_m2_cat <- hypothesis(m2_cat, "second_decisionstay < 0")
+
+m2_flood <- brm(bf(second_flood ~ second_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience + outcome_cond,
+                sigma ~ second_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m2_flood_aamas")
+h_m2_flood <- hypothesis(m2_flood, "second_decisionstay < 0")
+
+m2_outage <- brm(bf(second_outage ~ second_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience + outcome_cond,
+                sigma ~ second_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m2_outage_aamas")
+h_m2_outage <- hypothesis(m2_outage, "second_decisionstay < 0")
+
+
+### First day before the storm
+
+m1_cat <- brm(bf(first_cat_expected ~ first_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience + outcome_cond,
+                sigma ~ first_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m1_cat_aamas")
+h_m1_cat <- hypothesis(m1_cat, "first_decisionstay < 0")
+
+m1_flood <- brm(bf(first_flood ~ first_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience + outcome_cond,
+                sigma ~ first_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10),  iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m1_flood_aamas")
+h_m1_flood <- hypothesis(m1_flood, "first_decisionstay < 0")
+
+m1_outage <- brm(bf(first_outage ~ first_decision + 
+                   (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) + prev_hurricane_experience + outcome_cond,
+                sigma ~ first_decision), 
+              df, family = student(), seed = 7,
+              control = list(adapt_delta = 0.98, max_treedepth =10), iter = 4000, core = 2,
+              prior = c(prior(normal(0,10), class = b)),
+              file = "model/m1_outage_aamas")
+h_m1_outage <- hypothesis(m1_outage, "first_decisionstay < 0")
+
+```
+
+```{r echo = FALSE}
+
+### reward - diff ver
+m_diff_safety   <- brm(bf(diff05_physical_imp ~ evac_decision + outcome_cond + fifth_physical_imp 
+                              + (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) +
+                                prev_hurricane_experience, 
+                          sigma ~ evac_decision ), 
+                       df, family = student(), seed = 999, 
+                       control = list(adapt_delta = 0.99, max_treedepth =10), iter = 4000,
+                       prior = c(prior(normal(0,10), class = b)),
+                       file = "model/m_diff_safety_aamas" )
+
+m_diff_flood    <- brm(bf(diff05_flooded_imp ~ evac_decision + outcome_cond + fifth_flooded_imp 
+                              + (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) +
+                                prev_hurricane_experience, 
+                          sigma ~ evac_decision ), 
+                       df, family = student(), seed = 999, 
+                       control = list(adapt_delta = 0.99, max_treedepth =10), iter = 4000,
+                       prior = c(prior(normal(0,10), class = b)),
+                       file = "model/m_diff_flood_aamas" )
+
+m_diff_outage  <- brm(bf(diff05_outage_imp ~ evac_decision + outcome_cond + fifth_outage_imp 
+                              + (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) +
+                                prev_hurricane_experience, 
+                          sigma ~ evac_decision ), 
+                       df, family = student(), seed = 999, 
+                       control = list(adapt_delta = 0.99, max_treedepth =10), iter = 4000,
+                       prior = c(prior(normal(0,10), class = b)),
+                       file = "model/m_diff_outage_aamas" )
+
+m_diff_evaccost <- brm(bf(diff05_evaccost_imp ~ evac_decision + outcome_cond + fifth_evaccost_imp 
+                              + (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) +
+                                prev_hurricane_experience, 
+                          sigma ~ evac_decision ), 
+                       df, family = student(), seed = 999, 
+                       control = list(adapt_delta = 0.99, max_treedepth =10), iter = 4000,
+                       prior = c(prior(normal(0,10), class = b)),
+                       file = "model/m_diff_evaccost_aamas" ) 
+
+h_m_diff_safety    <- hypothesis(m_diff_safety,"evac_decisionstay < 0")
+h_m_diff_flood     <- hypothesis(m_diff_flood,"evac_decisionstay < 0")
+h_m_diff_outage    <- hypothesis(m_diff_outage,"evac_decisionstay < 0")
+h_m_diff_evaccost  <- hypothesis(m_diff_evaccost,"evac_decisionstay > 0")
+
+### Reward - Post ver.
+## The result is the same as using diff.
+
+# m_post_safety   <- brm(bf(zero_physical_imp ~ evac_decision + outcome_cond + fifth_physical_imp 
+#                               + (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) +
+#                                 prev_hurricane_experience, 
+#                           sigma ~ evac_decision ), 
+#                        df, family = student(), seed = 999, 
+#                        control = list(adapt_delta = 0.95, max_treedepth =10), iter = 4000,
+#                        prior = c(prior(normal(0,10), class = b)) )
+# 
+# m_post_flood    <- brm(bf(zero_flooded_imp ~ evac_decision + outcome_cond + fifth_flooded_imp 
+#                               + (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) +
+#                                 prev_hurricane_experience, 
+#                           sigma ~ evac_decision ), 
+#                        df, family = student(), seed = 999, 
+#                        control = list(adapt_delta = 0.95, max_treedepth =10), iter = 4000,
+#                        prior = c(prior(normal(0,10), class = b)) )
+# 
+# m_post_outage  <- brm(bf(zero_outage_imp ~ evac_decision + outcome_cond + fifth_outage_imp 
+#                               + (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) +
+#                                 prev_hurricane_experience, 
+#                           sigma ~ evac_decision ), 
+#                        df, family = student(), seed = 999, 
+#                        control = list(adapt_delta = 0.95, max_treedepth =10), iter = 4000,
+#                        prior = c(prior(normal(0,10), class = b)) )
+# 
+# m_post_evaccost <- brm(bf(zero_evaccost_imp ~ evac_decision + outcome_cond + fifth_evaccost_imp 
+#                               + (1|distance_to_coast) + (1|income) + (1|edu) + (1|florida_area_EWC) +
+#                                 prev_hurricane_experience, 
+#                           sigma ~ evac_decision ), 
+#                        df, family = student(), seed = 999, 
+#                        control = list(adapt_delta = 0.95, max_treedepth =10), iter = 4000,
+#                        prior = c(prior(normal(0,10), class = b)) ) 
+
+#hypothesis(m_post_safety,"evac_decisionstay < 0")
+#hypothesis(m_post_flood,"evac_decisionstay < 0")
+#hypothesis(m_post_outage,"evac_decisionstay < 0")
+#hypothesis(m_post_evaccost,"evac_decisionstay > 0")
+
+
+```
+
+
+## Results Visualization
+
+
+### Overall Visualization
+
+```{r echo = FALSE}
+
+#dat_temp <- dat[dat$evac_decision != "No decision",]
+
+dat_temp <- dat_exclude[dat_exclude$evac_decision != "No decision",]
+
+
+t <- table(dat_temp$when_evac, dat_temp$outcome_cond)
+
+dat_t <- data.frame(t)
+
+dat_t$Var1 <- mapvalues(dat_t$Var1, from = c("fifth_evac","fourth_evac","third_evac","second_evac","first_evac","stay"),
+                        to= c("5 days before","4 days before","3 days before","2 days before","1 day before","stay"))
+
+ggplot(dat_t[dat_t$Var1 != "No decision",], aes(x = Var1, y = Freq, fill = Var2) ) + geom_bar(stat = "identity", position="dodge") + ylab("Count") + xlab("When evac") + scale_fill_discrete(name = "Condition", labels = c("1: Cat 4","2: Cat 2"))
+
+c1 <- rep(sum(t[,1]),8) - c(0,cumsum(t[,1]))
+c2 <- rep(sum(t[,2]),8) - c(0,cumsum(t[,2]))
+
+t[1:6,1] <- t[1:6,1]/c1[1:6]
+t[1:6,2] <- t[1:6,2]/c2[1:6]
+dat_t <- data.frame(t)
+dat_t <- dat_t[dat_t$Var1 !="No decision" & dat_t$Var1 != "stay",]
+
+#ggplot(dat_temp, aes(x = when_evac, fill = outcome_cond)) + geom_bar(position = "dodge")
+ggplot(dat_t, aes(x = Var1, y = Freq, fill = Var2) ) + geom_bar(stat = "identity", position="dodge") + ylab("Frequency") + xlab("When evac") + ylim(0,1.0) + scale_fill_discrete(name = "Cond", labels = c("Cat 4","Cat 2"))
+
+ggplot(dat_t[dat_t$Var2 == 1,], aes(x = Var1, y = Freq) ) + geom_bar(stat = "identity", position="dodge") + ylab("Frequency") + xlab("When evac") + ylim(0,1.0) 
+
+ggplot(dat_t[dat_t$Var2 == 2,], aes(x = Var1, y = Freq) ) + geom_bar(stat = "identity", position="dodge") + ylab("Frequency") + xlab("When evac") + ylim(0,1.0) 
+
+##Combine graph require simulation results
+sim_result <- read.csv("sim_result_adj_evaccost.csv")
+##sim_result <- read.csv("sim_result_adj_flood.csv")
+
+dat_to_plot <- data.frame(
+  prob = c(dat_t$Freq[dat_t$Var2 == 1 & dat_t$Var1 != "fifth_evac"], sim_result$prob[sim_result$info == "Info=(7,7,9,9)"]),
+  type = rep(c("Data","Lookahead-NoCope","Baseline","Lookahead-Cope"),each = 4),
+  time = rep(c(1,2,3,4),4)
+) 
+
+dat_to_plot$type <- factor(dat_to_plot$type, levels = c("Data","Baseline","Lookahead-NoCope","Lookahead-Cope"))
+
+### Explain the probability 
+
+ggplot(dat_to_plot[dat_to_plot$type == "Data",], aes(x = time, y = prob) ) + geom_bar(stat = "identity", width = 0.5) + 
+  geom_line(data =  dat_to_plot[dat_to_plot$type != "Data",], aes(x = time, y = prob, group = type, col = type, linetype = type))  + 
+  geom_point(data =  dat_to_plot[dat_to_plot$type != "Data",],aes(shape = type, col = type)) + 
+  ylab("Probability/Frequency") + xlab("time") + ylim(0,.8) + theme(legend.position = "bottom")
+
+
+
+
+ggplot(dat_to_plot[dat_to_plot$type == "Data",], aes(x = time, y = prob) ) + geom_bar(stat = "identity", width = 0.5) + 
+  geom_line(data =  dat_to_plot[dat_to_plot$type != "Data" & dat_to_plot$type != "Lookahead-NoCope",], aes(x = time, y = prob, group = type, col = type, linetype = type))  + 
+  geom_point(data =  dat_to_plot[dat_to_plot$type != "Data" & dat_to_plot$type != "Lookahead-NoCope" ,],aes(shape = type, col = type)) + 
+  ylab("Probability/Frequency") + xlab("time") + ylim(0,.8) + theme(legend.position = "bottom")
+
+
+
+
+dat_to_plot <- data.frame(
+  prob = c(dat_t$Freq[dat_t$Var2 == 2 & dat_t$Var1 != "fifth_evac"], sim_result$prob[sim_result$info == "Info=(7,7,5,5)"]),
+  type = rep(c("Data","Lookahead-NoCope","Baseline","Lookahead-Cope"),each = 4),
+  time = rep(c(1,2,3,4),4)
+) 
+
+dat_to_plot$type <- factor(dat_to_plot$type, levels = c("Data","Baseline","Lookahead-NoCope","Lookahead-Cope"))
+
+### Explain the probability 
+
+ggplot(dat_to_plot[dat_to_plot$type == "Data",], aes(x = time, y = prob) ) + geom_bar(stat = "identity", width = 0.5) + 
+  geom_line(data =  dat_to_plot[dat_to_plot$type != "Data",], aes(x = time, y = prob, group = type, col = type, linetype = type))  + 
+  geom_point(data =  dat_to_plot[dat_to_plot$type != "Data",],aes(shape = type, col = type)) + 
+  ylab("Probability/Frequency") + xlab("time") + ylim(0,.8) + theme(legend.position = "bottom")
+
+
+```
+
+### Fitting Visualization
+
+#### Graph
+
+```{r echo = FALSE}
+
+dat_h_cat <- data.frame( h_fourth_cat = h_m4_cat$samples,
+                         h_third_cat  = h_m3_cat$samples,
+                         h_second_cat = h_m2_cat$samples,
+                         h_first_cat  = h_m1_cat$samples   )
+colnames(dat_h_cat) <- c("4 days before","3 days before","2 days before","1 day before")
+
+dat_h_flood <- data.frame( h_fourth_flood = h_m4_flood$samples,
+                           h_third_flood  = h_m3_flood$samples,
+                           h_second_flood = h_m2_flood$samples,
+                           h_first_flood  = h_m1_flood$samples   )
+colnames(dat_h_flood) <- c("4 days before","3 days before","2 days before","1 day before")
+
+dat_h_outage <- data.frame( h_fourth_outage = h_m4_outage$samples, 
+                            h_third_outage  = h_m3_outage$samples,
+                            h_second_outage = h_m2_outage$samples,
+                            h_first_outage  = h_m1_outage$samples)
+colnames(dat_h_outage) <- c("4 days before","3 days before","2 days before","1 day before")
+
+
+dat_h_goal   <- data.frame( h_safety = h_m_diff_safety$samples,
+                            h_flood  = h_m_diff_flood$samples,
+                            h_outage = h_m_diff_outage$samples,
+                            h_evac_cost = h_m_diff_evaccost$samples)
+colnames(dat_h_goal) <- c("Safety","Flooding","Outage","Evac cost")
+
+g1 <- mcmc_areas(dat_h_cat, prob = 0.89, point_est = "mean") + xlab("Expected Category") + ggtitle("Difference between Stay and Evac")
+g2 <- mcmc_areas(dat_h_flood, prob = 0.89, point_est = "mean") + xlab("Flood depth (inch)") + ggtitle("Difference between Stay and Evac")
+g3 <- mcmc_areas(dat_h_outage, prob = 0.89, point_est = "mean") + xlab("Outage Duration (day)") + ggtitle("Difference between Stay and Evac") 
+g4 <- mcmc_areas(dat_h_goal, prob = 0.89, point_est = "mean") + xlab("Importance (0 - 100)") + ggtitle("Difference between Stay and Evac")
+
+plot_grid(g1,g2,g3,g4,nrow = 2, ncol = 2)
+
+```
+
+#### Table
+
+```{r echo = FALSE}
+
+dat_belief <- data.frame( Belief = c("Category","Flood","Outage",
+                                   "Category","Flood","Outage",
+                                   "Category","Flood","Outage",
+                                   "Category","Flood","Outage"),
+                          Est = round(c(h_m4_cat$hypothesis$Estimate,h_m4_flood$hypothesis$Estimate,h_m4_outage$hypothesis$Estimate,
+                                  h_m3_cat$hypothesis$Estimate,h_m3_flood$hypothesis$Estimate,h_m3_outage$hypothesis$Estimate,
+                                  h_m2_cat$hypothesis$Estimate,h_m2_flood$hypothesis$Estimate,h_m2_outage$hypothesis$Estimate,
+                                  h_m1_cat$hypothesis$Estimate,h_m1_flood$hypothesis$Estimate,h_m1_outage$hypothesis$Estimate),2),
+                          SE  = round(c(h_m4_cat$hypothesis$Est.Error,h_m4_flood$hypothesis$Est.Error,h_m4_outage$hypothesis$Est.Error,
+                                  h_m3_cat$hypothesis$Est.Error,h_m3_flood$hypothesis$Est.Error,h_m3_outage$hypothesis$Est.Error,
+                                  h_m2_cat$hypothesis$Est.Error,h_m2_flood$hypothesis$Est.Error,h_m2_outage$hypothesis$Est.Error,
+                                  h_m1_cat$hypothesis$Est.Error,h_m1_flood$hypothesis$Est.Error,h_m1_outage$hypothesis$Est.Error),2),
+                          CI.Lower = round(c(h_m4_cat$hypothesis$CI.Lower,h_m4_flood$hypothesis$CI.Lower,h_m4_outage$hypothesis$CI.Lower,
+                                  h_m3_cat$hypothesis$CI.Lower,h_m3_flood$hypothesis$CI.Lower,h_m3_outage$hypothesis$CI.Lower,
+                                  h_m2_cat$hypothesis$CI.Lower,h_m2_flood$hypothesis$CI.Lower,h_m2_outage$hypothesis$CI.Lower,
+                                  h_m1_cat$hypothesis$CI.Lower,h_m1_flood$hypothesis$CI.Lower,h_m1_outage$hypothesis$CI.Lower),2),
+                          CI.Upper = round(c(h_m4_cat$hypothesis$CI.Upper,h_m4_flood$hypothesis$CI.Upper,h_m4_outage$hypothesis$CI.Upper,
+                                  h_m3_cat$hypothesis$CI.Upper,h_m3_flood$hypothesis$CI.Upper,h_m3_outage$hypothesis$CI.Upper,
+                                  h_m2_cat$hypothesis$CI.Upper,h_m2_flood$hypothesis$CI.Upper,h_m2_outage$hypothesis$CI.Upper,
+                                  h_m1_cat$hypothesis$CI.Upper,h_m1_flood$hypothesis$CI.Upper,h_m1_outage$hypothesis$CI.Upper),2),
+                          Prob = round(c(h_m4_cat$hypothesis$Post.Prob,h_m4_flood$hypothesis$Post.Prob,h_m4_outage$hypothesis$Post.Prob,
+                                  h_m3_cat$hypothesis$Post.Prob,h_m3_flood$hypothesis$Post.Prob,h_m3_outage$hypothesis$Post.Prob,
+                                  h_m2_cat$hypothesis$Post.Prob,h_m2_flood$hypothesis$Post.Prob,h_m2_outage$hypothesis$Post.Prob,
+                                  h_m1_cat$hypothesis$Post.Prob,h_m1_flood$hypothesis$Post.Prob,h_m1_outage$hypothesis$Post.Prob),2)
+                          )
+
+dat_goal   <- data.frame( Goal = c("Safety","Flood","Outage","Evac cost"),
+                          Est = round(c(h_m_diff_safety$hypothesis$Estimate,h_m_diff_flood$hypothesis$Estimate,
+                                        h_m_diff_outage$hypothesis$Estimate,h_m_diff_evaccost$hypothesis$Estimate),2),
+                          SE  = round(c(h_m_diff_safety$hypothesis$Est.Error,h_m_diff_flood$hypothesis$Est.Error,
+                                        h_m_diff_outage$hypothesis$Est.Error,h_m_diff_evaccost$hypothesis$Est.Error),2),
+                          CI.Lower  = round(c(h_m_diff_safety$hypothesis$CI.Lower,h_m_diff_flood$hypothesis$CI.Lower,
+                                        h_m_diff_outage$hypothesis$CI.Lower,h_m_diff_evaccost$hypothesis$CI.Lower),2),
+                          CI.Upper  = round(c(h_m_diff_safety$hypothesis$CI.Upper,h_m_diff_flood$hypothesis$CI.Upper,
+                                        h_m_diff_outage$hypothesis$CI.Upper,h_m_diff_evaccost$hypothesis$CI.Upper),2),
+                          Prob = round(c(h_m_diff_safety$hypothesis$Post.Prob,h_m_diff_flood$hypothesis$Post.Prob,
+                                        h_m_diff_outage$hypothesis$Post.Prob,h_m_diff_evaccost$hypothesis$Post.Prob),2)
+)
+```
+
+```{r echo = FALSE, fig.width = 6}
+dat_belief %>%
+  kbl( format = "html", table.attr = "style='width:60%;'", caption = "Table 2. The estimated difference between stay and evac group for each beliefs across time",  font_size = 20) %>%
+  kable_classic() %>%
+  pack_rows("4 days before the storm",1,3) %>%
+  pack_rows("3 days before the storm",4,6) %>%
+  pack_rows("2 days before the storm",7,9) %>%
+  pack_rows("1 days before the storm",10,12) 
+
+
+dat_goal %>%
+  kbl( format = "html", table.attr = "style='width:60%;'", caption = "Table 3. The estimated difference between stay and evac group for each goal",font_size = 20) %>%
+  kable_classic()
+
+```
+
+
+
+
+
