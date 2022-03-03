@@ -1,0 +1,2183 @@
+---
+title: "Hurricane Simulation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+## The Earlier version of this simulation/model is implemented in python
+## This is probably not so good idea to implement in R.
+## However due to familarity with distribution library (and time), I decide to implement this in R for now.
+
+library(ggplot2)
+library(brms)
+library(truncnorm)
+library(cowplot)
+library(discreteRV)
+library(viridis)
+library(gaussDiff)
+library(kableExtra)
+library(knitr)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+<!-- Helper Function -->
+
+```{r Helper_Function, echo = FALSE}
+
+##Prior is the base. order matters for kld
+
+kld <- function(outcome_prior,outcome_adj)
+{
+  if(length(outcome_prior) != length(outcome_adj)) {return("ERROR")} 
+  kld <- 0
+  for(i in 1:length(outcome_prior))
+  {
+    kld <- kld + outcome_prior[i]*log(outcome_prior[i]/outcome_adj[i]) 
+  }
+  return(kld)
+}
+
+sd_diff <- function(outcome_prior, outcome_adj)
+{
+  sd <- cal_sd(1:length(outcome_prior), outcome_prior)
+  peak_prior <- which.max(outcome_prior)
+  peak_adj <- which.max(outcome_adj)
+  diff <- abs(peak_prior - peak_adj)/sd
+  return(diff)
+}
+
+peak_diff <- function(outcome_prior, outcome_adj)
+{
+  peak_prior <- which.max(outcome_prior)
+  peak_adj <- which.max(outcome_adj)
+  return(abs(peak_prior - peak_adj))
+}
+
+## Reward Weight  ---------------------------------------------------------------------------------------
+### Base Value: (from Hurricane Florence and Michael)
+### Everything is framed in term of cost (negative weight).
+### Bias is positive reflecting the tendency to stay (default choice)
+### Default from Florence
+#### w_bias     <- 3.5
+#### w_not_safe <- -4.5
+#### w_flood    <- -0.4
+#### w_outage   <- -0.1
+#### w_ev_cost  <- -0.6 
+
+
+gen_reward_weight <- function(w_bias, w_not_safe, w_flood,w_outage, w_ev_cost)
+{
+  return(c(w_bias, w_not_safe, w_flood,w_outage, w_ev_cost))
+}
+
+## util_evac <- bias*w_bias + flood*w_flood + outage*w_outage
+## util_stay <- -1*safety*w_safety + (-1*ev_cost*w_ev_cost)
+### Bias term is from evac perspective because of regression predicting P(evac)
+
+cal_reward <- function(s,w)
+{
+  return(sum(s*w))
+}
+
+
+prob_evac_soft <- function(util_evac,util_stay)
+{
+  max_v <- max(util_evac,util_stay)
+  util_evac_adj <- exp(util_evac - max_v)
+  util_stay_adj <- exp(util_stay - max_v)
+  return( util_evac_adj/(util_evac_adj + util_stay_adj))
+}
+
+
+## Information - Accuracy Distribution   -----------------------------------------------------------------
+
+## Accuracy distribution = P(O = News_reports_of_hurricane_outcome|S = hurricane_outcome) 
+## Accuracy is need to calculate the likelihood. 
+## Accurcay = If the true state = s, how likely the info will show o = s. (P(O = s_i|S=s)) 
+## On the other hand, likelihood function is about Prob of observing o = s 
+##      given different possible true state (P(O = s|S=s_i))
+
+## sd can be one value or a list of sd for each value
+gen_acc <- function(min_value,max_value, sd, plot = FALSE)
+{
+  result <- list()
+  outcome <- seq(from = min_value, to = max_value)
+  for(i in 1:length(outcome))
+  {
+    acc_temp <- dtruncnorm(outcome, a = min_value, b = max_value, mean = outcome[i], sd = sd[i])
+    
+    ## rounding and normalize
+    acc_temp <- acc_temp/sum(acc_temp)
+    result[[as.character(i)]] <- acc_temp 
+  }
+  if(plot)
+  {
+    df <- data.frame(prob = unlist(result), 
+                   given = as.factor(rep(   c(min_value:max_value), each = length(outcome))), 
+                   predict = as.factor(rep( c(min_value:max_value),length(outcome))))
+    g <- ggplot(df, aes(x = predict, y= prob, group = given, color = given)) + geom_point() + geom_line() + 
+      ggtitle(paste("Accuracy [P(predict|given)], sd =", paste(as.character(sd),collapse = '')))
+    print(g)
+  }
+  
+  return(result)
+}
+
+
+## Prior and State --------------------------------------------------------------------------------------
+
+gen_prior <- function(min_value,max_value,mean,sd)
+{
+   outcome <- seq(from = min_value, to = max_value)
+   prior_temp <- dtruncnorm(outcome, a = min_value, b = max_value, mean = mean, sd = sd)
+    
+   ## rounding and normalize
+   prior_temp <- prior_temp/sum(prior_temp)
+   return(prior_temp)
+}
+
+
+## Using data.frame as dict
+gen_state <- function(time = 1, outcome_dist, evac_cost, outcome_util, w_evac_cost, reward_weight )
+{
+  dat_temp <- list(
+    time = time,
+    outcome_dist = outcome_dist, ## current beliefs
+    evac_cost = evac_cost,
+    stay_util = sum(outcome_dist*outcome_util),
+    V = 0.0,
+    Q_stay = 0.0,
+    Q_evac = evac_cost*w_evac_cost, ## == evac_util
+    reward_weight = reward_weight
+    #,prob_obs_list = c(),
+    #Q_stay_list = c()
+  )
+  return(dat_temp)
+}
+
+
+## Update Function  -------------------------------------------------------------------------------------
+
+## Assume that the support for prior and likelihood is the same.
+## The format for prior and likelihood is just a list of the outcomes
+gen_posterior <- function(prior,likelihood)
+{
+  posterior <- likelihood*prior
+  return(posterior/sum(posterior))
+}
+
+gen_prob_of_obs <- function(prior,likelihood)
+{
+  return(sum(prior*likelihood))
+}
+
+## Gen likelihood of obs O
+gen_likelihood <- function(acc, obs)
+{
+  likelihood <- c()
+  for(i in 1:length(acc))
+  {
+    likelihood <- c(likelihood, acc[[as.character(i)]][obs])
+  }
+  return(likelihood)
+}
+
+## Referense dependence 
+gen_q_refense <- function(state)
+{
+  m  <- (state$Q_stay + state$Q_evac)/2
+  state$Q_stay_adj <- state$Q_stay - m
+  state$Q_evac_adj <- state$Q_evac - m
+  
+  m1 <- (state$stay_util + state$Q_evac)/2
+  state$stay_util_adj <- state$stay_util - m1
+  state$evac_util_adj <- state$Q_evac - m1
+  
+  return(state)
+}
+
+
+cal_v_adj <- function(q_evac,q_stay,q_evac_adj,q_stay_adj)
+{
+  ifelse(q_evac > q_stay, return(q_evac_adj), return(q_stay_adj))
+}
+
+
+
+## Forward Search  ------------------------------------------------------------------------------------
+### This forward search is written specifically for this setup and can't be generalize
+### For each node, the next time step only concerns about stay action because it leads to the next day.
+### On the other hand, because evac always leads to terminal state, we can short-circuit it by just calculated Q_EVac for each state.
+
+forward_search <- function(state, max_time_step, outcome_util, acc_list, reward_weight, evac_cost_list, discounted=1.0, policy = NULL)
+{
+   if(state$time >= max_time_step )
+   {
+     state$Q_stay <- state$stay_util
+     if(is.null(policy))
+      {
+        state$V <- max(state$Q_stay,state$Q_evac)
+      }else if(policy == "stay")
+      {
+        state$V <- state$Q_stay
+      }else if(policy == "evac")
+      {
+        state$V <- state$Q_evac
+      }
+     return(state)
+  }
+  state$V_O <- c()
+  ##For stay action, loop through each observation
+  for(i in 1:length(outcome_util))
+  {
+     ## Gen the likelihood for the next time step observation o = i
+     likelihood <- gen_likelihood(acc_list[[state$time+1]],i)   ##Assume obesrvation range from 1 to length(outcome_util)
+     posterior  <- gen_posterior(state$outcome_dist,likelihood)
+
+     ##Gen new state from the current state (and calculate Q_evac_cost)
+     newState <- gen_state(time = state$time +1, outcome_dist = posterior, 
+                           evac_cost = evac_cost_list[state$time+1], 
+                           outcome_util = outcome_util, w_evac_cost = reward_weight[5],reward_weight)
+     newState <- forward_search(newState, max_time_step, outcome_util, acc_list, reward_weight, evac_cost_list, discounted, policy)
+     
+     prob_of_obs  <- gen_prob_of_obs(state$outcome_dist, likelihood)
+     state$V_O[i] <- newState$V
+     state$Q_stay <- state$Q_stay + discounted*(prob_of_obs*newState$V)
+     
+     ## Debugging
+     ##state$prob_obs_list <- c(state$prob_obs_list,prob_of_obs)
+     ##state$Q_stay_list   <- c(state$Q_stay_list,newState$V)
+  }
+  if(is.null(policy))
+  {
+    state$V <- max(state$Q_stay,state$Q_evac)
+  }else if(policy == "stay")
+  {
+    state$V <- state$Q_stay
+  }else if(policy == "evac")
+  {
+    state$V <- state$Q_evac
+  }
+  return(state)
+}
+
+## Helper for discrete sd where index = value
+cal_sd <- function(base,probs)
+{
+  m <- sum(base*probs)
+  var <- sum(((base - m)^2)*probs)
+  return( sqrt(var) )
+}
+
+## Adjust Beliefs -------------------------------------------------------------------------------------
+###  generate a set of beliefs with the same sd given a list of means
+### The first index of the list is always the initial value
+### Beliefs that out of bound is set to the bound
+gen_adjust_beliefs <- function(min,max, width, peak, sd)
+{
+  out_list <- list()
+  peaks <- c( (peak-width):(peak+width) )
+  peaks <- ifelse(peaks > max, max, peaks)
+  peaks <- ifelse(peaks < min, min, peaks)
+
+  mid <- (length(peaks)%/%2) + 1
+
+  for(i in 1:length(peaks))
+  {
+    temp_dist <- dtruncnorm(min:max, a= min,b=max, mean = peaks[i], sd=sd)
+    temp_dist <- temp_dist/sum(temp_dist)
+    
+    if(i == mid ) { 
+      out_list[[1]] <- temp_dist
+    }
+    else if(i < mid)
+    {
+      out_list[[i+1]] <- temp_dist
+    }
+    else if(i > mid)
+    {
+      out_list[[i]] <- temp_dist
+    }
+  }
+  return(out_list)
+}
+
+## Gen alternative beliefs based on seeing different obs/info instead
+## acc_list == acc_list at a specific time t.
+gen_adjusted_beliefs_obs <- function(prior, acc_list, width, obs_0)
+{
+  min <- 1 
+  max <- length(prior)
+  out_list <- list()
+  obs_list <- c((obs_0-width):(obs_0+width))
+  obs_list <- ifelse(obs_list > max, max, obs_list)
+  obs_list <- ifelse(obs_list < min, min, obs_list)
+  mid <- (length(obs_list)%/%2) + 1
+  
+  for(i in 1:length(obs_list))
+  {
+    ll <- gen_likelihood(acc_list,obs_list[i])
+    temp_dist <- gen_posterior(prior,ll)
+    if(i == mid){
+      out_list[[1]] <- temp_dist
+    }else if(i < mid)
+    {
+      out_list[[i+1]] <- temp_dist
+    }else if(i > mid)
+    {
+      out_list[[i]] <- temp_dist
+    }
+  }
+  return(out_list)
+}
+
+## Function to generate a set of reward weights given a change
+gen_adjusted_reward_weight_list <- function(initial_reward, adj_target, adj_percentage, adj_width)
+{
+  reward_list <- list(initial_reward)
+  if(adj_width <= 0)
+  {
+    return(reward_list)
+  }
+  
+  ind <- 2
+  for(i in c(adj_width:1))
+  {
+    temp_reward <- initial_reward
+    temp_reward[adj_target] <- temp_reward[adj_target] - i*abs(temp_reward[adj_target]*adj_percentage)
+    reward_list[[ind]] <- temp_reward
+    ind <- ind+1
+  }
+  for(i in 1:adj_width)
+  {
+    temp_reward <- initial_reward
+    temp_reward[adj_target] <- temp_reward[adj_target] + i*abs(temp_reward[adj_target]*adj_percentage)
+    reward_list[[ind]] <- temp_reward
+    ind <- ind+1
+  }
+  return(reward_list)
+}
+
+## https://stats.stackexchange.com/questions/7440/kl-divergence-between-two-univariate-gaussians
+kld_uni_normal <- function(mu1,mu2, sigma1, sigma2)
+{
+  return(log(sigma1/sigma2) + (sigma1^2 + (mu1 - mu2)^2)/(2*(sigma2^2)) - 0.5  )
+}
+
+bel_cost_weight <- 0.5
+
+## Function to calculate the cost of coping, both beliefs and goals 
+cal_cost <- function(bel_initial,bel_target, reward_initial, reward_target, reward_sd, cost_function = "kld")
+{
+  bel_cost <- bel_cost_weight*kld(bel_initial, bel_target)
+  reward_cost <- 0.0
+  for(i in 1:length(reward_initial))
+  {
+    reward_cost <- reward_cost + kld_uni_normal(reward_initial[i], reward_target[i], reward_sd[i], reward_sd[i])
+  }
+  return(bel_cost + reward_cost)
+}
+
+## Parameters for the simulation
+### 1) Prior
+### 2) Reward Weights (Util_stay, Util_evac)
+### 3) Accuracy
+### 4) evac_costs (list of evac_cost across time)
+### 5) hurricane_outcomes   
+### 6) Time step == How many days before the hurricane
+### 7) Observation = The set of actual observation 
+### Return initial state with V and Q value
+simulation <- function(prior, start_time, time_step, reward_weight, acc_list, evac_cost_list, hurricane_outcomes, obs_info, 
+                       discounted = 1.0, horizon = 999, independent = TRUE, 
+                       adj_bel_width = 0, adj_reward_target = 0, adj_reward_percentage = 0, adj_reward_width = 0,
+                       reward_sd = rep(1,5), pick_best = FALSE, intention_on = FALSE)
+{
+  min_outcome <- 1
+  max_outcome <- dim(hurricane_outcomes)[1]
+  
+  ##Log money
+  evac_cost_list <- log1p(evac_cost_list)
+  ## Pre-computed utility of the hurricane outcomes
+  hurricane_outcomes$util <- sapply(1:11, function(i) cal_reward(hurricane_outcomes[i,1:5],reward_weight)) 
+  initial_state <- gen_state(time =start_time, outcome_dist = prior, evac_cost = evac_cost_list[start_time],
+                              outcome_util = hurricane_outcomes$util, w_evac_cost =  reward_weight[5],
+                              reward_weight)
+  cumul_ind <- 1
+  result_states <- list()
+  ##loop through Observe
+  for(i in 1:length(obs_info))
+  {
+    if(independent){
+      prior_temp <- initial_state$outcome_dist  
+    }else{
+      ## 
+      prior_temp <- prior 
+    }
+    posteriors <- gen_adjusted_beliefs_obs(prior = prior_temp, acc_list[[initial_state$time]],adj_bel_width,obs_info[i])
+    ## Update the current state given the info 
+    initial_state$outcome_dist <- gen_posterior(prior = prior_temp,
+                                                gen_likelihood(acc_list[[initial_state$time]],obs_info[i]))
+    
+    ### Adjust Beliefs using sd
+    # posteriors <- gen_adjust_beliefs(1, max_outcome, adj_width, 
+    #                                  peak = which.max(initial_state$outcome_dist), 
+    #                                  sd = cal_sd(1:max_outcome, probs = initial_state$outcome_dist))
+
+    posteriors[[1]] <- initial_state$outcome_dist
+    
+    reward_lists <- gen_adjusted_reward_weight_list(reward_weight,adj_reward_target,
+                                                    adj_reward_percentage,adj_reward_width)
+    best_index <- cumul_ind
+    initial_ind <- cumul_ind
+    V_max <- -9999999
+    
+    for(j in 1:length(posteriors))
+    {
+      for(k in 1:length(reward_lists))
+      {
+        ##Forward Search
+        hurricane_outcomes$util <- sapply(1:11, function(i) cal_reward(hurricane_outcomes[i,1:5],reward_lists[[k]])) 
+        initial_state <- gen_state(time = initial_state$time, outcome_dist =  posteriors[[j]], 
+                                   evac_cost = evac_cost_list[initial_state$time],
+                                   outcome_util = hurricane_outcomes$util, w_evac_cost =  reward_lists[[k]][5],
+                                   reward_lists[[k]])
+        
+        temp_state <- forward_search(initial_state, max_time_step = min(time_step, initial_state$time + horizon), 
+                                  hurricane_outcomes$util, acc_list, 
+                                  reward_lists[[k]], evac_cost_list, discounted) 
+        
+        ##Add reference dependence utility calculation (only add to the last layer)
+        result_states[[cumul_ind]] <- gen_q_refense(temp_state)
+        
+        ##V_adj is based on the initial intention
+        if( (result_states[[cumul_ind]]$time == 1 && intention_on == TRUE) || intention_on == FALSE) {
+          result_states[[cumul_ind]]$V_adj <- cal_v_adj(result_states[[initial_ind]]$Q_evac,result_states[[initial_ind]]$Q_stay,
+                                                      result_states[[cumul_ind]]$Q_evac_adj,result_states[[cumul_ind]]$Q_stay_adj)
+        }else{
+          ## if the time > 1, it implies that the agent has stayed for at least once
+          ## This results in intention == stay
+          if(intention_on == "stay" || intention_on == TRUE)
+          {
+            result_states[[cumul_ind]]$V_adj <- result_states[[cumul_ind]]$Q_stay_adj
+          }
+          if(intention_on == "evac")
+          {
+            result_states[[cumul_ind]]$V_adj <- result_states[[cumul_ind]]$Q_evac_adj
+          }
+        }
+        
+        cope_cost <- cal_cost(result_states[[initial_ind]]$outcome_dist,
+                              result_states[[cumul_ind]]$outcome_dist,
+                              reward_weight, 
+                              result_states[[cumul_ind]]$reward_weight,reward_sd)
+
+        #print(result_states[[initial_ind]]$outcome_dist)
+        #print(result_states[[cumul_ind]]$outcome_dist)
+        #print(reward_weight)
+        #print(result_states[[cumul_ind]]$reward_weight)
+        #print(cope_cost)
+        
+        if(result_states[[cumul_ind]]$V_adj - cope_cost > V_max)
+        {
+          V_max <- result_states[[cumul_ind]]$V_adj - cope_cost
+          best_index <- cumul_ind
+        }
+        
+        ##Add discounted info
+        result_states[[cumul_ind]]$discounted <- discounted
+        result_states[[cumul_ind]]$bel_index  <- j
+        result_states[[cumul_ind]]$rew_index  <- k
+        result_states[[cumul_ind]]$cope_cost  <- cope_cost
+        cumul_ind <- cumul_ind+1
+      }
+    }
+    #print(best_index)
+    ##Picking the best for the next step
+    if(pick_best)
+    {
+      initial_state <- result_states[[best_index]]
+      #print(initial_state)
+    }else{
+      ## Posterior becomes prior for the next state
+      initial_state <- result_states[[cumul_ind - length(posteriors) ]]  ##initial_value
+    }
+    
+    initial_state <- gen_state(time = initial_state$time +1, outcome_dist = initial_state$outcome_dist, 
+                               evac_cost = evac_cost_list[initial_state$time+1], 
+                               outcome_util = hurricane_outcomes$util, w_evac_cost = reward_weight[5], 
+                               initial_state$reward_weight)
+  }
+  
+  return(result_states)
+}
+
+
+
+```
+
+
+```{r echo = FALSE}
+
+## Visualization Functions
+
+gen_label <- function(width)
+{
+  ##create a label
+  front <- c()
+  back  <- c()
+  i <- 1
+  while(i < width/2)
+  {
+    front[i] <- -1*(width%/%2) + (i-1)
+    back[i]  <- i
+    i <- i + 1
+  }
+  labels <- c("base",front,back)
+  return(labels)
+}
+
+## Turn a list of obs into str/word
+obs_str <- function(obs)
+{
+  return( paste0("Info=(",paste(obs,collapse=","),")") )
+}
+
+visualize_utility <- function(outcomes, evac_costs, w )
+{
+  out_len <- dim(outcomes)[1]
+  prob <- c()
+  for(ec in evac_costs)
+  {
+    outcomes$evac_cost <- rep(-1*log1p(ec), out_len)
+    prob_temp <- sapply(c(1:11), function(i) 1 - inv_logit_scaled(cal_reward(outcomes[i,2:6],w)))
+    prob <- c(prob,prob_temp)
+  }
+  
+  dat <- data.frame( prob_evac = prob,
+                     evac_cost = as.factor(rep(evac_costs, each = out_len)),
+                     hurricane_outcomes = rep(c(1:out_len),length(evac_costs)))
+  
+  g <- ggplot(dat, aes(x = hurricane_outcomes, y = prob_evac, group = evac_cost, col = evac_cost)) + 
+    geom_point(aes(shape = evac_cost)) + geom_line(aes(linetype = evac_cost)) + 
+    ggtitle(paste("bias=",w[1],",w_safety=",w[2],",w_flood=",w[3],",w_outage=",w[4],",w_ev_cost=",w[5]))
+  return(g)
+}
+
+
+
+### Generate Visualization Results
+
+visualize_results <- function(results, obs)
+{
+  len <- length(results)
+  interval <- results[[len]]$time - results[[1]]$time +1
+  width <- len/interval
+  ##create a label
+  labels <- gen_label(width)
+  
+  g_list <- list()
+  dat   <- data.frame()
+  dat_u <- data.frame()
+  dat_prob <- data.frame()
+  i <- 1
+  for(i in  1:length(results))
+  {
+    ind_labels <- i%%width
+    ind_labels <- ifelse(ind_labels==0,width,ind_labels)
+    #ecah loop for each time
+    dat_temp <- data.frame( outcome = c(1:length(results[[i]]$outcome_dist)),
+                       outcome_prob = results[[i]]$outcome_dist,
+                       time = results[[i]]$time,
+                       index = labels[ind_labels]
+                       )
+    dat <- rbind(dat,dat_temp)
+    
+    if(ind_labels == 1)
+    {
+      dat_u_temp <- data.frame( value  = c(results[[i]]$Q_stay, results[[i]]$stay_util, results[[i]]$Q_evac),
+                                type   = c("Q(stay)-Base","Util(stay)","Q(evac)"),
+                                time   = rep(results[[i]]$time,3),
+                                category   = rep("base",3))
+      dat_prob_temp <- data.frame( prob = c(prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),
+                                            prob_evac_soft(results[[i]]$Q_evac,results[[i]]$stay_util)),
+                            type = c("Q(stay)-Base","Util(stay)"),
+                            time = rep(results[[i]]$time,2),
+                            category = rep("base",2))
+    }else{
+      
+      
+      dat_u_temp <- data.frame( value  = results[[i]]$Q_stay,
+                                type   = paste("Q(stay)",labels[ind_labels]),
+                                time   = results[[i]]$time,
+                                category   = "adj")
+      dat_prob_temp <- data.frame( prob = prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),
+                            type = paste("Q(stay)",labels[ind_labels]),
+                            time = results[[i]]$time, 
+                            category = "adj")
+    }
+    
+    dat_u <- rbind(dat_u,dat_u_temp)
+    dat_prob <- rbind(dat_prob,dat_prob_temp)
+  }
+  
+  #dat$index <- as.factor(dat$index)
+  dat_u$category <- factor(dat_u$category, levels = c("adj","base"),ordered = TRUE)
+  dat_prob$category <- factor(dat_prob$category, levels = c("adj","base"),ordered = TRUE)
+  
+  time_list <- c(results[[1]]$time:results[[length(results)]]$time)
+  
+  for(i in 1:length(time_list))
+  {
+    dat_temp <- dat[dat$time == time_list[i],]
+    g <- ggplot(dat_temp, aes(x = outcome, y = outcome_prob, col = index, size = index)) + geom_point() + 
+         geom_line(aes(linetype = index)) + 
+            #ggtitle(paste("U(stay) =",round(results[[i]]$stay_util,3),",Q_stay =", round(results[[i]]$Q_stay,3),
+            #        ",Q_evac =",round(results[[i]]$Q_evac,3),
+            #        ", Prob(evac) = ", round(prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),3))) +
+            ylim(0,1) + theme(legend.position="none") + scale_size_manual(values=c(1,rep(0.5,width-1))) + 
+            scale_linetype_manual(values=c("solid",rep("twodash",width-1))) + ggtitle(paste("time = ",time_list[i],", Observe = ", obs[i],sep=""))
+    g_list[[i]] <- g
+    ##
+  }
+  
+  ##Utility/ Q value across time of all three/five (with adj)
+  g_u <- ggplot(dat_u, aes(x = time, y = value, group = type, col = type, size = category)) + geom_point() + 
+    geom_line(aes(linetype = category)) + 
+    scale_size_manual(values=c(1,0.5)) + scale_linetype_manual(values=c("solid","twodash")) + ylab("Value/Utility")
+  
+  ##Prob of Evac across time 
+  g_p <- ggplot(dat_prob, aes(x = time, y = prob, group = type, col = type, size = category)) + 
+    geom_point() + geom_line(aes(linetype = category)) + ylim(0,1) + 
+    scale_size_manual(values=c(1,0.5)) + scale_linetype_manual(values=c("solid","twodash")) + ylab("Prob")
+  
+  legend1 <- get_legend(g_list[[1]] + guides(col = guide_legend(nrow=1)) +  theme(legend.position="bottom", legend.box = "horizontal") )
+  
+  first_part <- plot_grid(plotlist = g_list, nrow = 1)
+  first_part <- plot_grid(first_part,legend1, ncol=1, rel_heights = c(1,.1))
+  second_part <- plot_grid(g_u,g_p,nrow=1)
+  print(first_part)
+  #print(second_part)
+  
+  #plot_grid(first_part,second_part, nrow=2)
+  
+  #return(g_list)
+}
+
+visualize_adjusted_beliefs <- function(results)
+{
+  len <- length(results)
+  interval <- results[[len]]$time - results[[1]]$time +1
+  width <- len/interval
+  labels <- gen_label(width)
+  labels[1] <- 0
+  
+  ##Create a new data.frame for plotting
+  dat <- data.frame()
+  for(i in 1:length(results))
+  {
+    if(i%%width == 1 || width == 1)
+    {
+      base_ind <- i
+    }
+    
+    dat_temp <- data.frame(
+      Q_stay = results[[i]]$Q_stay,
+      Q_stay_adj = results[[i]]$Q_stay_adj,
+      Q_evac = results[[i]]$Q_evac,
+      Q_evac_adj = results[[i]]$Q_evac_adj,
+      V = results[[i]]$V,
+      V_adj =  cal_v_adj( results[[base_ind]]$Q_evac,results[[base_ind]]$Q_stay,
+                          results[[i]]$Q_evac_adj,results[[i]]$Q_stay_adj),
+      action = ifelse(results[[i]]$Q_stay > results[[i]]$Q_evac, "stay","evac"),
+      action_adj = ifelse(results[[base_ind]]$Q_stay_adj > results[[base_ind]]$Q_evac_adj,"stay","evac"),
+      prob_evac = prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),
+      prob_evac_adj = prob_evac_soft(results[[i]]$Q_evac_adj,results[[i]]$Q_stay_adj),
+      time = results[[i]]$time,
+      index = ifelse(i%%width == 0, labels[width], labels[i%%width]),
+      sd = round(cal_sd(1:length(results[[i]]$outcome_dist),results[[i]]$outcome_dist),2)
+    )
+    dat <- rbind(dat,dat_temp)
+  }
+  dat$index <- as.numeric(as.character(dat$index))
+  dat$index <- factor(dat$index, c(min(dat$index):max(dat$index)), ordered = TRUE)
+  
+  g_list <- list()
+  for(t in min(dat$time):max(dat$time))
+  {
+    dat_temp <- dat[dat$time ==t,]
+    g_list[[t]] <- ggplot(dat_temp, aes(y = prob_evac, x = index)) + geom_bar(stat="identity", fill = ifelse(dat_temp$action_adj=="stay","red","blue")) + xlab("Adjustment") + ylab("Prob evac") + ggtitle(paste("time =",t,"sd =",dat_temp$sd[1])) + ylim(0.0,1.0)
+  }
+  
+  print(plot_grid(plotlist = g_list, nrow = 1))
+}
+
+
+display_all <- function(prior, start_time, time_step, reward_weight, acc_list, evac_cost_list, hurricane_outcomes, obs_list, adj_bel_width)
+{
+  for(o in obs_list)
+  {
+    result <- simulation(prior, start_time, time_step, reward_weight, 
+                     acc_list, evac_cost_list, hurricane_outcomes, obs_info = o, adj_bel_width)
+    print(o)
+    visualize_results(result,o)
+    #visualize_adjusted_beliefs(result)
+  }
+}
+
+
+display_group_reward_obs <- function(prior, start_time, time_step, reward_list, reward_name, acc_list, evac_cost_list, 
+                                     hurricane_outcomes, obs_list, adj_bel_width)
+{
+  width <- adj_bel_width*2 + 1
+  labels <- gen_label(width)
+  dat_prob <- data.frame()
+  for(r in 1:length(reward_list))
+  {
+    for(o in obs_list)
+    {
+      obs <- obs_str(o)
+      results <- simulation(prior, start_time, time_step, reward_list[[r]], acc_list,evac_cost_list, hurricane_outcomes, o, adj_bel_width)
+      ##Prob
+      for(i in 1:length(results))
+      {
+        ind_labels <- i%%width
+        ind_labels <- ifelse(ind_labels==0,width,ind_labels)
+        
+        if(ind_labels == 1)
+        {
+          dat_prob_temp <- data.frame( prob = c(prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),
+                                            prob_evac_soft(results[[i]]$Q_evac,results[[i]]$stay_util)),
+                                type = c("Q(stay)-Base","Util(stay)"),
+                                time = rep(results[[i]]$time,2),
+                                category = rep("base",2),
+                                reward  = rep(reward_name[r],2),
+                                info = rep(obs,2))
+        }else{
+          dat_prob_temp <- data.frame( prob = prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),
+                            type = paste("Q(stay)",labels[ind_labels]),
+                            time = results[[i]]$time, 
+                            category = "adj",
+                            reward   = reward_name[r],
+                            info  = obs)
+        }
+        dat_prob <- rbind(dat_prob,dat_prob_temp)
+      }
+    }
+  }
+  dat_prob$time <- factor(dat_prob$time)
+  
+  ## Plot
+   g_p <- ggplot(dat_prob, aes(x = time, y = prob, group = type, col = type)) + 
+    geom_point() + geom_line(aes(linetype = type)) + ylim(0,1) + 
+    #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+    facet_grid(reward ~ info) 
+   print(g_p)
+}
+
+## Gen the result in the dataframe for the combination
+gen_all_results <- function(start_time, time_step,  priors, prior_name, reward_list, reward_name, acc_lists, acc_lists_name, 
+                            evac_cost_list, evac_cost_name, hurricane_outcomes, obs_list, horizon,
+                            adj_bel_width,
+                            adj_reward_target, adj_reward_percentage, adj_reward_width, reward_sd, intention_on)
+{
+  width <- ifelse(adj_bel_width != 0, adj_bel_width*2 + 1, adj_reward_width*2 + 1)
+  labels <- gen_label(width)
+  dat<- data.frame()
+  
+  for(p in 1:length(priors))
+  {
+    for(r in 1:length(reward_list))
+    {
+      for(acc in 1:length(acc_lists))
+      {
+        for(ev in 1:length(evac_cost_list))
+        {
+          for(o in obs_list)
+          {
+            obs <- obs_str(o)
+            
+            results <- simulation(priors[[p]], start_time, time_step, reward_list[[r]], 
+                                  acc_lists[[acc]],evac_cost_list[[ev]], 
+                                  hurricane_outcomes =  hurricane_outcomes, obs_info =  o, horizon = horizon,
+                                  adj_bel_width = adj_bel_width, adj_reward_target = adj_reward_target,
+                                  adj_reward_percentage = adj_reward_percentage, adj_reward_width = adj_reward_width,
+                                  reward_sd = reward_sd, intention_on = intention_on)
+            ##Save the result
+            base_ind <- -1
+            for(i in 1:length(results))
+            {
+               ind_labels <- i%%width
+               ind_labels <- ifelse(ind_labels==0,width,ind_labels)
+               
+               if(ind_labels == 1)
+               {
+                 base_ind <- i ##For adj cost calculation
+                 dat_temp <- data.frame( prob = c(prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),
+                                            prob_evac_soft(results[[i]]$Q_evac,results[[i]]$stay_util)),
+                                         prob_util = c(prob_evac_soft(results[[i]]$Q_evac,results[[i]]$stay_util),
+                                            prob_evac_soft(results[[i]]$Q_evac,results[[i]]$stay_util)),
+                                         q = c(results[[i]]$Q_stay,results[[i]]$stay_util),
+                                         q_adj = c(results[[i]]$Q_stay_adj,results[[i]]$stay_util),
+                                         util_adj = c(max(results[[i]]$stay_util_adj,results[[i]]$evac_util_adj),NA),
+                                         v = results[[i]]$V,
+                                         v_adj = results[[i]]$V_adj,
+                                         v_util = max(results[[i]]$stay_util,results[[i]]$Q_evac),
+                                         action = ifelse(results[[i]]$Q_evac > results[[i]]$Q_stay, "evac","stay"),
+                                         action_util = ifelse(results[[i]]$Q_evac > results[[i]]$stay_util,"evac","stay"),
+                                type = c("Q(stay)-Base","Util(stay)"),
+                                diff_v = c(0,NA),
+                                diff_util = c(0,NA),
+                                adj  = c(0,NA),
+                                kld = c(0,NA),
+                                sd_diff = c(0,NA),
+                                peak_diff = c(0,NA),
+                                time = rep(results[[i]]$time,2),
+                                category = rep("base",2),
+                                reward  = rep(reward_name[r],2),
+                                info = rep(obs,2),
+                                prior = rep(prior_name[p],2),
+                                accuracy = rep(acc_lists_name[acc],2),
+                                evac_cost = rep(evac_cost_name[ev],2),
+                                cope_cost = results[[i]]$cope_cost)
+               }else{
+                 
+                #normdiff(mu1 = rw, mu2 =nu_rw, sigma1 = sg, sigma2 = sd, method ="KL") 
+                 
+                dat_temp <- data.frame( prob = prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),
+                                        prob_util = prob_evac_soft(results[[i]]$Q_evac,results[[i]]$stay_util),
+                                        q = results[[i]]$Q_stay,
+                                        q_adj = results[[i]]$Q_stay_adj,
+                                        util_adj = cal_v_adj(results[[base_ind]]$evac_util_adj,results[[base_ind]]$stay_util_adj,
+                                                     results[[i]]$evac_util_adj,results[[i]]$stay_util_adj),
+                                        v     = results[[i]]$V,
+                                        v_adj = results[[i]]$V_adj,
+                                        v_util = max(results[[i]]$stay_util,results[[i]]$Q_evac),
+                                        action = ifelse(results[[base_ind]]$Q_evac > results[[base_ind]]$Q_stay, "evac","stay"),
+                                        action_util = ifelse(results[[base_ind]]$Q_evac > results[[base_ind]]$stay_util,"evac","stay"),
+                            type = paste("Q(stay)",labels[ind_labels]),
+                            diff_v = cal_v_adj(results[[base_ind]]$Q_evac,results[[base_ind]]$Q_stay,
+                                                  results[[i]]$Q_evac_adj,results[[i]]$Q_stay_adj) - 
+                                      max(results[[base_ind]]$Q_stay_adj,results[[base_ind]]$Q_evac_adj),
+                            diff_util =  cal_v_adj(results[[base_ind]]$evac_util_adj,results[[base_ind]]$stay_util_adj,
+                                                  results[[i]]$evac_util_adj,results[[i]]$stay_util_adj) - 
+                                        max(results[[base_ind]]$stay_util_adj,results[[base_ind]]$evac_util_adj),
+                            adj  = c(labels[ind_labels]),
+                            kld  = kld(results[[base_ind]]$outcome_dist,results[[i]]$outcome_dist),
+                            sd_diff = sd_diff(results[[base_ind]]$outcome_dist,results[[i]]$outcome_dist),
+                            peak_diff = peak_diff(results[[base_ind]]$outcome_dist,results[[i]]$outcome_dist),
+                            time = results[[i]]$time, 
+                            category = "adj",
+                            reward   = reward_name[r],
+                            info  = obs,
+                            prior = prior_name[p],
+                            accuracy = acc_lists_name[acc],
+                            evac_cost = rep(evac_cost_name[ev]),
+                            cope_cost = results[[i]]$cope_cost)
+               }
+               
+               
+               dat <- rbind(dat,dat_temp)
+            }
+            
+          }
+        }
+      }
+    }
+  }
+  
+  return(dat)
+}
+
+
+results_list_to_dat <- function(results)
+{
+  dat <- data.frame()
+  for(i in 1:length(results))
+  {
+    dat_temp <- data.frame(
+      time = results[[i]]$time,
+      evac_cost = results[[i]]$evac_cost,
+      stay_util = results[[i]]$stay_util,
+      V = results[[i]]$V,
+      Q_stay = results[[i]]$Q_stay,
+      Q_evac = results[[i]]$Q_evac,
+      Q_stay_adj = results[[i]]$Q_stay_adj,
+      Q_evac_adj = results[[i]]$Q_evac_adj,
+      V_adj      = results[[i]]$V_adj,
+      cope_cost  = results[[i]]$cope_cost,
+      prob = prob_evac_soft(results[[i]]$Q_evac,results[[i]]$Q_stay),
+      V_adj_cost = results[[i]]$V_adj - results[[i]]$cope_cost
+    )
+    dat <- rbind(dat,dat_temp)
+  }
+  return(dat)
+}
+
+## Returning the best result for a given time 
+## All_results is order by time for each set of configuration of the simulation
+## 
+final_all_result <- function(all_results)
+{
+  min_time <- min(all_results$time)
+  max_time <- max(all_results$time)
+  dat <- data.frame()
+  cur_time <- all_results$time[1]
+  max_v_final <- all_results$v_adj[1] - all_results$cope_cost[1]
+  max_ind  <- 1
+  for(i in c(2:dim(all_results)[1]))
+  {
+    if(i > dim(all_results)[1])
+    {
+      break;
+    }
+    ##New time 
+    if(all_results$time[i] != cur_time)
+    {
+      ## Save the result
+      dat <- rbind(dat, all_results[max_ind,])
+      
+      ## Move to the next time
+      cur_time <- all_results$time[i]
+      max_v_final <- (all_results$v_adj[i] - all_results$cope_cost[i])
+      max_ind <- i
+    }else{
+      temp_v_final <- (all_results$v_adj[i] - all_results$cope_cost[i])
+      if(max_v_final < temp_v_final)
+      {
+        max_v_final <- temp_v_final
+        max_ind <- i
+      }
+    }
+  }
+  ## One more for the last time step
+  dat <- rbind(dat, all_results[max_ind,])
+  return(dat)
+}
+
+visual_across_time <- function(results, y,x)
+{
+  result_dat <- results_list_to_dat(results)
+  
+}
+
+gen_accumulative_evac_percent <- function(final)
+{
+  dat_temp <- data.frame(
+    prob = final$prob,
+    time = final$time,
+    kind = final$kind,
+    info = final$info
+  )
+  
+  
+}
+
+
+```
+
+## Parameters Declaration
+
+```{r}
+
+## Outcomes/Features in the state  -----------------------------------------------------------------------------------
+### Number of Hurricane Outcome 4, 5, 10 
+## Flood depth (feet): [0 - 6]
+## Outage Dur (days):  [0 - 30]
+## Not_Safe (Prob): [0 -  1]   0 = Safe, 1 = Danger
+## Evac cost (log1p dollar): [0 - 7] ([0 - 1000]) (Always define as log1p to make it clean)
+
+hurricane_outcomes <- data.frame(     
+  stay_bias     = rep(1,11),
+  not_safe_prob = c(0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 ,0.8, 0.9, 0.95),
+  flood_depth   = c(0, 0.5,   1, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,  5.0),
+  outage_dur    = c(0,   4,   8,  12,  16,  20,  24,  28,  32,  36,   40),
+  evac_cost     = rep(0,11)
+)
+
+
+min_outcome <- 1
+max_outcome <- 11
+
+prior_uni <- gen_prior(min_outcome,max_outcome,6,100)  ## ~ unifor prior (sd -> inf)
+prior2 <- gen_prior(min_outcome,max_outcome,6,5)    ## center
+prior_good <- gen_prior(min_outcome,max_outcome,2,5)    ## Good prior
+prior_bad <- gen_prior(min_outcome,max_outcome,9,5)    ## Bad prior
+
+priors <- list(prior_uni, prior_good, prior_bad)
+prior_name <- c("prior:uniform","prior:good","prior:bad")
+
+time = 4  ## Time before the hurricane hits == number of observation including the first one == number of decisions
+
+acc_t1 <- gen_acc(1,11,rep(3,11))
+acc_t2 <- gen_acc(1,11,rep(2,11))
+acc_t3 <- gen_acc(1,11,rep(1.5,11))
+acc_t4 <- gen_acc(1,11,rep(1.25,11))
+acc_t45 <- gen_acc(1,11,rep(1,11))
+acc_t5 <- gen_acc(1,11,rep(.75,11))
+acc_t6 <- gen_acc(1,11,rep(.5,11))
+
+acc_t1_b <-  gen_acc(1,11,c(rep(3,5),rep(3.5,6)))
+acc_t2_b <-  gen_acc(1,11,c(rep(2,5),rep(2.75,6)))
+acc_t3_b <-  gen_acc(1,11,c(rep(1,5),rep(2,6)))
+acc_t4_b <-  gen_acc(1,11,c(rep(0.75,5),rep(1.5,6)))
+acc_t5_b <-  gen_acc(1,11,c(rep(0.5,5),rep(1.25,6)))
+
+acc_t1_c <-  gen_acc(1,11,c(rep(3.5,5),rep(3,6)))
+acc_t2_c <-  gen_acc(1,11,c(rep(2.75,5),rep(2,6)))
+acc_t3_c <-  gen_acc(1,11,c(rep(2,5),rep(1,6)))
+acc_t4_c <-  gen_acc(1,11,c(rep(1.5,5),rep(0.75,6)))
+acc_t5_c <-  gen_acc(1,11,c(rep(1.25,5),rep(0.5,6)))
+
+
+acc_list1 <- list(acc_t1,acc_t2,acc_t3,acc_t4)
+acc_list15 <- list(acc_t3,acc_t4,acc_t5,acc_t6)
+acc_list2 <- list(acc_t2,acc_t3,acc_t5,acc_t6)
+acc_list1_b <- list(acc_t1_b,acc_t2_b,acc_t4_b,acc_t5_b)
+acc_list1_c <- list(acc_t2_c,acc_t3_c,acc_t4_c,acc_t5_c)
+
+acc_lists <- list(acc_list1,acc_list15,acc_list1_b,acc_list1_c)
+acc_name <- c("acc:standard","acc:strong","acc:skew_left","acc:skew_right")
+
+
+evac_cost_list1 <- c(150,400,800,1500)
+evac_cost_list2 <- c(100,200,400,800)
+evac_cost_list3 <- c(100,120,150,200)
+evac_cost_list4 <- c(200,500,1200,4500)
+
+evaccost_list <- list(evac_cost_list4, evac_cost_list1, evac_cost_list2)
+evaccost_name <- c("evaccost:High","evaccost:Mid","evaccost:Low")
+
+## Bias == higher more likely to stay
+
+reward_weights_mean <- gen_reward_weight(w_bias = 2.5, w_not_safe = -4.5, 
+                            w_flood = -0.5, w_outage = -0.17, w_ev_cost = -1.0)
+reward_weights_evac <- gen_reward_weight(w_bias = 2.3, w_not_safe = -4.5, 
+                            w_flood = -0.5,w_outage = -0.2, w_ev_cost = -0.9)
+reward_weights_stay <- gen_reward_weight(w_bias = 2.6, w_not_safe = -4.5, 
+                            w_flood = -0.5, w_outage = -0.15, w_ev_cost = -1.1)
+reward_index <- list("bias" = 1,"not_safe" = 2,"flood" = 3,"outage" = 4,"ev_cost" = 5)
+reward_sd <- c(0.5, 0.2, 0.3, 0.7, 0.5) #safe, flood, outage, ev_cost
+
+
+reward_name <- c("reward = mean","reward = toward_evac","reward = toward_stay")
+reward_list <- list(reward_weights_mean,reward_weights_evac,reward_weights_stay)
+
+
+obs_list <- list(c(3,3,3,3),
+                 c(9,9,9,9),
+                 c(7,7,9,9),
+                 c(7,7,5,5)
+                 ,c(7,7,7,7)
+                 )
+
+```
+
+
+## Simulation Results with Beliefs Distributions
+
+### Standard Acc and Uniform Prior 
+
+```{r fig.width=12, fig.height=4}
+
+display_all(prior_uni,start_time = 1, time_step = 4, reward_weight = reward_weights_mean,
+            acc_list = acc_list1, evac_cost_list = evac_cost_list1, 
+            hurricane_outcomes,obs_list, adj_bel_width = 0)
+```
+
+### Standard Acc and Bad Prior 
+
+```{r fig.width=12, fig.height=4}
+display_all(prior_bad,start_time = 1, time_step = 4, reward_weight = reward_weights_mean,
+            acc_list = acc_list1,evac_cost_list = evac_cost_list1,
+            hurricane_outcomes,obs_list, adj_bel_width = 0)
+```
+
+
+## Simulation Results Grid
+
+### Setting up
+```{r eval = FALSE}
+
+all_result <- gen_all_results(start_time = 1, time_step = 4, priors = priors, 
+                   prior_name = prior_name, reward_list = reward_list, 
+                   reward_name = reward_name, acc_lists = acc_lists,
+                   acc_lists_name = acc_name, evac_cost_list = evaccost_list, 
+                   evac_cost_name = evaccost_name,hurricane_outcomes, 
+                   obs_list = obs_list, horizon = 999, adj_bel_width = 0, adj_reward_target = 0,
+                   adj_reward_percentage = 0, adj_reward_width = 0,
+                   reward_sd = reward_sd, intention_on = FALSE)
+all_result$time <- factor(all_result$time)
+all_result$prior <- factor(all_result$prior, levels = c("prior:good",
+                                                        "prior:uniform",
+                                                        "prior:bad"))
+
+save(all_result, file = "all_result_sim.rds")
+```
+
+### Reward x Info: (Prior:Uniform, Acc:standard, evaccost:High)
+
+```{r echo=FALSE, fig.width=12}
+load(file = "all_result_sim.rds")
+
+## Plot
+ggplot(all_result[all_result$prior == "prior:uniform" & 
+                  all_result$accuracy == "acc:standard" & 
+                  all_result$evac_cost == "evaccost:High",], 
+       aes(x = time, y = prob, group = type, col = type)) + 
+    geom_point() + geom_line(aes(linetype = type)) + ylim(0,1) + 
+    geom_hline(yintercept = 0.5,  linetype = "longdash") + ylab("Prob(evac)") +
+    #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+    facet_grid(reward ~ info) 
+
+# ggplot(all_result[all_result$prior == "prior:uniform" & all_result$accuracy == "acc:standard" & all_result$evac_cost == "evaccost:High",], 
+#        aes(x = time, y = q, group = type, col = type)) + 
+#     geom_point() + geom_line(aes(linetype = type)) + 
+#     #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+#     facet_grid(reward ~ info) 
+
+```
+
+
+### Evaccost x Info: (Prior:Uniform, Acc:standard, reward = mean)
+
+```{r echo=FALSE, fig.width=12}
+
+ggplot(all_result[all_result$prior == "prior:uniform" & all_result$accuracy == "acc:standard" & all_result$reward == "reward = mean",], 
+       aes(x = time, y = prob, group = type, col = type)) + 
+    geom_point() + geom_line(aes(linetype = type)) + ylim(0,1) + 
+  geom_hline(yintercept = 0.5,  linetype = "longdash") + ylab("Prob(evac)") + 
+    #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+    facet_grid(evac_cost ~ info) 
+
+# ggplot(all_result[all_result$prior == "prior:good" & all_result$accuracy == "acc:standard" & all_result$reward == "reward = mean",], 
+#        aes(x = time, y = q, group = type, col = type)) + 
+#     geom_point() + geom_line(aes(linetype = type)) +
+#     #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+#     facet_grid(evac_cost ~ info) 
+
+```
+
+
+### Prior x Info: (Evaccost:High, Acc:standard, reward = evac)
+
+```{r echo=FALSE, fig.width=12}
+
+ggplot(all_result[all_result$evac_cost == "evaccost:High" & all_result$accuracy == "acc:standard" & all_result$reward == "reward = mean",], 
+       aes(x = time, y = prob, group = type, col = type)) + 
+    geom_point() + geom_line(aes(linetype = type)) + ylim(0,1) + 
+  geom_hline(yintercept = 0.5,  linetype = "longdash") + ylab("Prob(evac)") +
+    #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+    facet_grid(prior ~ info) 
+
+# ggplot(all_result[all_result$evac_cost == "evaccost:High" & all_result$accuracy == "acc:standard" & all_result$reward == "reward = mean",], 
+#        aes(x = time, y = q, group = type, col = type)) + 
+#     geom_point() + geom_line(aes(linetype = type))  +
+#     #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+#     facet_grid(prior ~ info) 
+
+```
+
+
+### Acc x Info: (Evaccost:High, Prior:Uniform, reward = evac)
+
+```{r echo=FALSE, fig.width=12}
+
+ggplot(all_result[all_result$evac_cost == "evaccost:High" & all_result$prior == "prior:uniform" & all_result$reward == "reward = mean",], 
+       aes(x = time, y = prob, group = type, col = type)) + 
+    geom_point() + geom_line(aes(linetype = type)) + ylim(0,1) + 
+  geom_hline(yintercept = 0.5,  linetype = "longdash") + ylab("Prob(evac)") +
+    #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+    facet_grid(accuracy ~ info) 
+
+# ggplot(all_result[all_result$evac_cost == "evaccost:High" & all_result$prior == "prior:uniform" & all_result$reward == "reward = mean",], 
+#        aes(x = time, y = q, group = type, col = type)) + 
+#     geom_point() + geom_line(aes(linetype = type)) +
+#     #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) + 
+#     facet_grid(accuracy ~ info) 
+
+```
+
+
+<!-- ### Adjusting Evac cost Weights with lookahead -->
+
+<!-- ```{r fig.height = 10, fig.width = 12, echo = FALSE} -->
+
+<!-- acc_lists <- list(acc_list1) -->
+<!-- acc_name <- c("acc:standard") -->
+
+<!-- evaccost_list <- list(evac_cost_list4) -->
+<!-- evaccost_name <- c("evaccost:ExtHigh") -->
+
+<!-- priors <- list(prior_uni) -->
+<!-- priors_name <- c("prior:uniform") -->
+
+
+<!-- reward_list <- list( c(2.0, -4.50, -0.50, -0.15, 0.0), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.1), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.2), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.3), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.4), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.5), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.6), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.7), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.8), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -0.9), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -1.0), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -1.1), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -1.2), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -1.3), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -1.4), -->
+<!--                      c(2.0, -4.50, -0.50, -0.15, -1.5)) -->
+<!-- reward_name <- c("0.0","-0.1","-0.2","-0.3","-0.4","-0.5","-0.6","-0.7","-0.8","-0.9","-1.0", -->
+<!--                  "-1.1","-1.2","-1.3","-1.4","-1.5") -->
+
+
+<!-- all_result_adj <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name, -->
+<!--                               reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists, -->
+<!--                               acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name, -->
+<!--                               hurricane_outcomes, obs_list = obs_list, horizon = 999, -->
+<!--                               adj_bel_width = 0, adj_reward_target = 0, -->
+<!--                               adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = FALSE) -->
+<!-- all_result_adj$time <- factor(all_result_adj$time) -->
+<!-- all_result_adj$adj  <- as.numeric(as.character(all_result_adj$adj)) -->
+
+<!-- ggplot(all_result_adj[all_result_adj$prior == "prior:uniform"  & all_result_adj$type != "Util(stay)",],  -->
+<!--        aes(x = reward, y = v_adj, fill = action))  + geom_bar(stat = "identity") +  -->
+<!--     #geom_point(aes(x = adj, y = 0.5*sd_diff^2)) + geom_line(aes(x = adj, y = 0.5*sd_diff^2), linetype = "twodash") + xlab("belief Adjustment") +  -->
+<!--     #scale_size_manual(values=c(0.5,1)) + scale_linetype_manual(values=c("twodash", "solid")) +  -->
+<!--     facet_grid(info ~ time)  -->
+
+<!-- ``` -->
+
+<!-- ### Adjusting Flooding weights with look ahead -->
+
+<!-- ```{r fig.height = 10, fig.width = 12, echo = FALSE} -->
+
+<!-- reward_list <- list( c(3.2, -4.50, -0.30, -0.2, -1.1), -->
+<!--                      c(3.2, -4.50, -0.40, -0.2, -1.1), -->
+<!--                      c(3.2, -4.50, -0.50, -0.2, -1.1), -->
+<!--                      c(3.2, -4.50, -0.60, -0.2, -1.1), -->
+<!--                      c(3.2, -4.50, -0.70, -0.2, -1.1), -->
+<!--                      c(3.2, -4.50, -0.80, -0.2, -1.1), -->
+<!--                      c(3.2, -4.50, -0.90, -0.2, -1.1), -->
+<!--                      c(3.2, -4.50, -1.0, -0.2, -1.1), -->
+<!--                      c(3.2, -4.50, -1.10, -0.2, -1.1)) -->
+<!-- reward_name <- c("-0.3","-0.4","-0.5","-0.6","-0.7","-0.8","-0.9","-1.0","-1.1") -->
+
+<!-- obs_list <- list(c(7,7,7,7), -->
+<!--                  c(7,7,9,9), -->
+<!--                  c(7,7,5,5) -->
+<!--                  ,c(8,8,8,8)) -->
+
+<!-- all_result_adj <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name, -->
+<!--                               reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists, -->
+<!--                               acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name, -->
+<!--                               hurricane_outcomes, obs_list = obs_list, horizon = 999, -->
+<!--                               adj_bel_width = 0, adj_reward_target = 0, -->
+<!--                               adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = FALSE) -->
+<!-- all_result_adj$action <- factor(all_result_adj$action, levels = c("stay","evac")) -->
+
+<!-- ggplot(all_result_adj[all_result_adj$type != "Util(stay)",],  -->
+<!--        aes(x = reward, y = prob, fill = action))  + geom_bar(stat = "identity") + xlab("reward_flood") + -->
+<!--     facet_grid(info ~ time) + ylim(0,1) -->
+<!-- ``` -->
+
+<!-- ### Adjusting Flooding Weights with no look ahead -->
+
+<!-- ```{r fig.height = 10, fig.width = 12, echo = FALSE} -->
+<!-- all_result_adj <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name, -->
+<!--                               reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists, -->
+<!--                               acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name, -->
+<!--                               hurricane_outcomes, obs_list = obs_list, horizon = 0, -->
+<!--                               adj_bel_width = 0, adj_reward_target = 0, -->
+<!--                               adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = FALSE) -->
+<!-- all_result_adj$action <- factor(all_result_adj$action, levels = c("stay","evac")) -->
+
+<!-- ggplot(all_result_adj[all_result_adj$type != "Util(stay)",],  -->
+<!--        aes(x = reward, y = prob, fill = action))  + geom_bar(stat = "identity") + xlab("reward_flood") +  -->
+<!--     facet_grid(info ~ time) + ylim(0,1) -->
+
+
+<!-- ## testing -->
+<!-- #View(all_result_adj[all_result_adj$info == "Info=(9,9,9,9)" & all_result_adj$prior == "prior:uniform" & all_result_adj$reward == "reward = mean",]) -->
+<!-- #result <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[2]], adj_bel_width =0) -->
+<!-- #result2 <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[2]], adj_bel_width =2, TRUE) -->
+<!-- #result3 <- simulation(priors[[1]],1,4,reward_list[[1]],acc_list1_b,evaccost_list[[1]],hurricane_outcomes, obs_list[[2]], adj_bel_width =3, TRUE) -->
+
+<!-- #result <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], adj_bel_width =0, adj_reward_target = 3, adj_reward_percentage = .2, adj_reward_width = 4, reward_sd = reward_sd, intention_on = TRUE) -->
+
+<!-- #result <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], adj_bel_width =0, adj_reward_target = 0, adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = FALSE) -->
+
+<!-- ``` -->
+
+
+<!-- ### Cost and Gain of chaning Beliefs -->
+
+<!-- ```{r echo = FALSE, fig.height=10, fig.width=12} -->
+
+
+<!-- acc_lists <- list(acc_list1) -->
+<!-- acc_name <- c("acc:standard") -->
+
+<!-- evaccost_list <- list(evac_cost_list1) -->
+<!-- evaccost_name <- c("evaccost:High") -->
+
+<!-- reward_list <- list(reward_weights_mean) -->
+<!-- reward_name <- c("reward = mean") -->
+
+<!-- priors <- list(priors[[1]]) -->
+<!-- prior_name <- c(prior_name[1]) -->
+
+<!-- obs_list <- list(rep(4,4), -->
+<!--                  rep(5,4), -->
+<!--                  rep(6,4), -->
+<!--                  rep(7,4), -->
+<!--                  rep(8,4), -->
+<!--                  rep(9,4)) -->
+
+<!-- all_result_adj <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name, -->
+<!--                               reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists, -->
+<!--                               acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name, -->
+<!--                               hurricane_outcomes, obs_list = obs_list, horizon = 999, -->
+<!--                               adj_bel_width = 3, adj_reward_target = 0, -->
+<!--                               adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = FALSE) -->
+<!-- all_result_adj$time <- factor(all_result_adj$time) -->
+<!-- all_result_adj$adj  <- as.numeric(as.character(all_result_adj$adj)) -->
+
+<!-- all_result_adj_temp <- all_result_adj[all_result_adj$type != "Util(stay)",] -->
+
+<!-- d <- dim(all_result_adj_temp)[1] -->
+<!-- num_weight <- 3 -->
+<!-- ## Cost dataframe -->
+<!-- cost_dat <- data.frame(  -->
+<!--   info = rep(all_result_adj_temp$info,num_weight), -->
+<!--   time = rep(all_result_adj_temp$time,num_weight), -->
+<!--   adj  = rep(all_result_adj_temp$adj,num_weight), -->
+<!--   kld  = c(all_result_adj_temp$kld, 0.5*all_result_adj_temp$kld, 0.25*all_result_adj_temp$kld), -->
+<!--   sd_diff = c(all_result_adj_temp$sd_diff, 0.5*all_result_adj_temp$sd_diff, 0.25*all_result_adj_temp$sd_diff), -->
+<!--   peak_diff = c(all_result_adj_temp$peak_diff^2, 0.5*all_result_adj_temp$peak_diff^2, 0.25*all_result_adj_temp$peak_diff^2), -->
+<!--   coef = c(rep(1,d), -->
+<!--                  rep(0.5,d), -->
+<!--                  rep(0.25,d)) -->
+<!--   ) -->
+
+<!-- #cost_dat$coef <- factor(cost_dat$coef, levels = c(0.25,0.5,1), ordered = TRUE) -->
+
+<!-- ggplot(all_result_adj_temp,  -->
+<!--        aes(x = adj, y = v_adj, fill = action))  + geom_vline(xintercept = 0, linetype = "solid", col = "darkgrey") +  -->
+<!--        geom_hline(yintercept = 0, linetype = "solid", col = "darkgrey")  + geom_bar(stat = "identity") + -->
+<!--     facet_grid(info ~ time)  -->
+
+
+<!-- ggplot(all_result_adj_temp,  -->
+<!--        aes(x = adj, y = diff_v))  + geom_vline(xintercept = 0, linetype = "solid", col = "darkgrey") +  -->
+<!--        geom_hline(yintercept = 0, linetype = "solid", col = "darkgrey")  + geom_bar(aes(fill = action),stat = "identity") +  -->
+<!--        geom_point(data = cost_dat, aes(x= adj, y=kld, group = coef, color = coef)) +  -->
+<!--   geom_line(data = cost_dat, aes(x= adj, y=kld, group = coef, color=coef)) + scale_color_gradient("KLD Coef",low ="#56B1F7", high ="#132B43") +  -->
+<!--     facet_grid(info ~ time) + ggtitle("KLD - Diff Utility") -->
+
+<!-- ggplot(all_result_adj_temp,  -->
+<!--        aes(x = adj, y = diff_v))  + geom_vline(xintercept = 0, linetype = "solid", col = "darkgrey") +  -->
+<!--        geom_hline(yintercept = 0, linetype = "solid", col = "darkgrey")  + geom_bar(aes(fill = action),stat = "identity") +  -->
+<!--        geom_point(data = cost_dat, aes(x= adj, y=sd_diff, group = coef, color = coef)) +  -->
+<!--   geom_line(data = cost_dat, aes(x= adj, y=sd_diff, group = coef, color=coef)) + scale_color_gradient("SD Coef",low ="#56B1F7", high ="#132B43") +  -->
+<!--     facet_grid(info ~ time) + ggtitle("SD - Diff Utility") -->
+
+
+<!-- ggplot(all_result_adj_temp,  -->
+<!--        aes(x = adj, y = diff_v))  + geom_vline(xintercept = 0, linetype = "solid", col = "darkgrey") +  -->
+<!--        geom_hline(yintercept = 0, linetype = "solid", col = "darkgrey")  + geom_bar(aes(fill = action),stat = "identity") +  -->
+<!--        geom_point(data = cost_dat, aes(x= adj, y=peak_diff, group = coef, color = coef)) +  -->
+<!--   geom_line(data = cost_dat, aes(x= adj, y=peak_diff, group = coef, color=coef)) + scale_color_gradient("Prob Coef",low ="#56B1F7", high ="#132B43") +   facet_grid(info ~ time) + ggtitle("Prob - Diff Utility") -->
+
+<!-- ``` -->
+
+
+##  Changing Beleifs and Goals Results - Ablation study
+
+### First Setup 
+
+```{r}
+acc_lists <- list(acc_list2)
+acc_name <- c("acc:standard")
+
+evaccost_list <- list(c(200,400,600,2000))
+evaccost_name <- c("evaccost:High")
+
+priors <- list(prior_uni)
+priors_name <- c("prior:uniform")
+
+reward_list <- list( c(3.7, -4.5, -0.5, -0.2, -1.0) )
+reward_name <- c("toward_evac")
+```
+
+#### Adj Reward - Adj evaccost
+
+```{r echo = FALSE, fig.width = 8}
+
+obs_list <- list(c(7,7,9,9),
+                 c(7,7,5,5)
+                 ,c(9,9,9,9),
+                 c(9,9,7,4))
+
+all_result_adj1 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, 
+                              intention_on = TRUE)
+all_result_adj1$action <- factor(all_result_adj1$action, levels = c("stay","evac"))
+
+final1 <- final_all_result(all_result_adj1[all_result_adj1$type != "Util(stay)",])
+final1$kind <- "Look Ahead-No Cope"
+
+all_result_adj2 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 0,
+                              adj_bel_width = 0, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj2$action <- factor(all_result_adj2$action, levels = c("stay","evac"))
+
+final2 <- final_all_result(all_result_adj2[all_result_adj2$type != "Util(stay)",])
+final2$kind <- "No Look-No Cope" 
+
+all_result_adj3 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 5,
+                              adj_reward_percentage = 0.05, adj_reward_width = 4, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj3$action <- factor(all_result_adj3$action, levels = c("stay","evac"))
+
+final3 <- final_all_result(all_result_adj3[all_result_adj3$type != "Util(stay)",])
+final3$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final3)
+
+write.csv(final,"sim_result_adj_evaccost.csv")
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")   + facet_wrap(~info)
+
+```
+
+#### Adj Reward - Adj Flood
+
+```{r echo = FALSE, fig.width = 8}
+
+all_result_adj3 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 3,
+                              adj_reward_percentage = 0.2, adj_reward_width = 5, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj3$action <- factor(all_result_adj3$action, levels = c("stay","evac"))
+
+final3 <- final_all_result(all_result_adj3[all_result_adj3$type != "Util(stay)",])
+final3$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final3)
+
+write.csv(final,"sim_result_adj_flood.csv")
+
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")   + facet_wrap(~info)
+
+```
+
+#### Adj Beliefs
+
+```{r echo = FALSE, fig.width = 8}
+
+## Note that: the change of belief is very crube so it would have been better if there are more category of outcomes
+all_result_adj4 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 1, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj4$action <- factor(all_result_adj4$action, levels = c("stay","evac"))
+
+final4 <- final_all_result(all_result_adj4[all_result_adj4$type != "Util(stay)",])
+final4$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final4)
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")  + facet_wrap(~info)
+
+```
+
+### Second Setup 
+
+```{r}
+acc_lists <- list(acc_list2)
+acc_name <- c("acc:standard")
+
+evaccost_list <- list(c(200,400,800,4000))
+evaccost_name <- c("evaccost:High")
+
+priors <- list(prior_uni)
+priors_name <- c("prior:uniform")
+
+reward_list <- list( c(3.7, -4.5, -0.5, -0.2, -1.0) )
+reward_name <- c("toward_evac")
+```
+
+#### Adj Reward - Adj evaccost
+
+```{r echo = FALSE, fig.width = 8}
+
+obs_list <- list(c(7,7,9,9),
+                 c(7,7,5,5)
+                 ,c(9,9,9,9),
+                 c(9,9,7,4))
+
+all_result_adj1 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, 
+                              intention_on = TRUE)
+all_result_adj1$action <- factor(all_result_adj1$action, levels = c("stay","evac"))
+
+final1 <- final_all_result(all_result_adj1[all_result_adj1$type != "Util(stay)",])
+final1$kind <- "Look Ahead-No Cope"
+
+all_result_adj2 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 0,
+                              adj_bel_width = 0, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj2$action <- factor(all_result_adj2$action, levels = c("stay","evac"))
+
+final2 <- final_all_result(all_result_adj2[all_result_adj2$type != "Util(stay)",])
+final2$kind <- "No Look-No Cope" 
+
+all_result_adj3 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 5,
+                              adj_reward_percentage = 0.05, adj_reward_width = 4, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj3$action <- factor(all_result_adj3$action, levels = c("stay","evac"))
+
+final3 <- final_all_result(all_result_adj3[all_result_adj3$type != "Util(stay)",])
+final3$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final3)
+
+write.csv(final,"sim_result_adj_evaccost.csv")
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")   + facet_wrap(~info)
+
+```
+
+#### Adj Reward - Adj Flood
+
+```{r echo = FALSE, fig.width = 8}
+
+all_result_adj3 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 3,
+                              adj_reward_percentage = 0.2, adj_reward_width = 5, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj3$action <- factor(all_result_adj3$action, levels = c("stay","evac"))
+
+final3 <- final_all_result(all_result_adj3[all_result_adj3$type != "Util(stay)",])
+final3$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final3)
+
+write.csv(final,"sim_result_adj_flood.csv")
+
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")   + facet_wrap(~info)
+
+```
+
+#### Adj Beliefs
+
+```{r echo = FALSE, fig.width = 8}
+
+## Note that: the change of belief is very crube so it would have been better if there are more category of outcomes
+all_result_adj4 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 1, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj4$action <- factor(all_result_adj4$action, levels = c("stay","evac"))
+
+final4 <- final_all_result(all_result_adj4[all_result_adj4$type != "Util(stay)",])
+final4$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final4)
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")  + facet_wrap(~info)
+
+```
+
+### Third Setup 
+
+```{r}
+acc_lists <- list(acc_list2)
+acc_name <- c("acc:standard")
+
+evaccost_list <- list(c(200,400,800,1600))
+evaccost_name <- c("evaccost:High")
+
+priors <- list(prior_uni)
+priors_name <- c("prior:uniform")
+
+reward_list <- list( c(3.8, -4.5, -0.55, -0.22, -1.0) )
+reward_name <- c("toward_evac")
+```
+
+#### Adj Reward - Adj evaccost
+
+```{r echo = FALSE, fig.width = 8}
+
+obs_list <- list(c(7,7,9,9),
+                 c(7,7,5,5)
+                 ,c(9,9,9,9),
+                 c(9,9,7,4))
+
+all_result_adj1 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, 
+                              intention_on = TRUE)
+all_result_adj1$action <- factor(all_result_adj1$action, levels = c("stay","evac"))
+
+final1 <- final_all_result(all_result_adj1[all_result_adj1$type != "Util(stay)",])
+final1$kind <- "Look Ahead-No Cope"
+
+all_result_adj2 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 0,
+                              adj_bel_width = 0, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj2$action <- factor(all_result_adj2$action, levels = c("stay","evac"))
+
+final2 <- final_all_result(all_result_adj2[all_result_adj2$type != "Util(stay)",])
+final2$kind <- "No Look-No Cope" 
+
+all_result_adj3 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 5,
+                              adj_reward_percentage = 0.05, adj_reward_width = 4, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj3$action <- factor(all_result_adj3$action, levels = c("stay","evac"))
+
+final3 <- final_all_result(all_result_adj3[all_result_adj3$type != "Util(stay)",])
+final3$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final3)
+
+write.csv(final,"sim_result_adj_evaccost.csv")
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")   + facet_wrap(~info)
+
+```
+
+#### Adj Reward - Adj Flood
+
+```{r echo = FALSE, fig.width = 8}
+
+all_result_adj3 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 0, adj_reward_target = 3,
+                              adj_reward_percentage = 0.2, adj_reward_width = 5, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj3$action <- factor(all_result_adj3$action, levels = c("stay","evac"))
+
+final3 <- final_all_result(all_result_adj3[all_result_adj3$type != "Util(stay)",])
+final3$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final3)
+
+write.csv(final,"sim_result_adj_flood.csv")
+
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")   + facet_wrap(~info)
+
+```
+
+#### Adj Beliefs
+
+```{r echo = FALSE, fig.width = 8}
+
+## Note that: the change of belief is very crube so it would have been better if there are more category of outcomes
+all_result_adj4 <- gen_all_results(start_time = 1, time_step = 4, priors = priors, prior_name = prior_name,
+                              reward_list = reward_list, reward_name = reward_name, acc_lists = acc_lists,
+                              acc_lists_name = acc_name, evac_cost_list = evaccost_list, evac_cost_name = evaccost_name,
+                              hurricane_outcomes, obs_list = obs_list, horizon = 999,
+                              adj_bel_width = 1, adj_reward_target = 0,
+                              adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd, intention_on = TRUE)
+all_result_adj4$action <- factor(all_result_adj4$action, levels = c("stay","evac"))
+
+final4 <- final_all_result(all_result_adj4[all_result_adj4$type != "Util(stay)",])
+final4$kind <- "Look Ahead-Cope" 
+
+final <- rbind(final1,final2,final4)
+
+ggplot(final, aes(x = time, y = prob, group = kind, color = kind)) + 
+  geom_point(size =2) + geom_line(aes(linetype = kind), size =0.8)  + 
+  ylim(0,1) + geom_hline(yintercept=0.5, linetype="dashed", color ="grey") + theme(legend.position="bottom")  + facet_wrap(~info)
+
+```
+
+
+## Difference Plots 
+
+### Beliefs Difference
+
+```{r echo = FALSE}
+
+acc_lists <- list(acc_list2)
+acc_name <- c("acc:standard")
+
+evaccost_list <- list(c(200,400,800,1600))
+evaccost_name <- c("evaccost:High")
+
+priors <- list(prior_uni)
+priors_name <- c("prior:uniform")
+
+
+reward_list <- list( c(3.7, -4.5, -0.5, -0.2, -1.0) )
+reward_name <- c("toward_evac")
+
+obs_list <- list(c(6,6,6,6))
+bel_cost_weight <- 0.5
+
+get_best_beliefs <- function(result)
+{
+  cur_time <- result[[1]]$time
+  max_v    <- -9999999
+  max_ind  <- 0
+  dat <- data.frame()
+  for(i in 1:length(result))
+  {
+    v_adj_cost <- result[[i]]$V_adj - result[[i]]$cope_cost
+    if(v_adj_cost > max_v)
+    {
+      max_v <- v_adj_cost
+      max_ind <- i
+    }
+    if(i == length(result) || result[[i+1]]$time != cur_time)
+    {
+       dat_temp <- data.frame( outcome = c(1:11),
+                               prob    = result[[max_ind]]$outcome_dist,
+                               time    = rep(paste("Time =", result[[max_ind]]$time),11),
+                               index   = rep(max_ind,11))
+       dat <- rbind(dat, dat_temp)
+       max_v <- -9999999
+       cur_time <- result[[i]]$time + 1
+    }
+  }
+  return(dat)
+}
+
+belief_stay <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], 
+                          adj_bel_width =3, adj_reward_target = 0, adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd,
+                          intention_on = "stay")
+#View(results_list_to_dat(belief_stay))
+dat_belief_stay <- get_best_beliefs(belief_stay)
+
+
+belief_evac <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], 
+                          adj_bel_width =3, adj_reward_target = 0, adj_reward_percentage = 0, adj_reward_width = 0, reward_sd = reward_sd,
+                          intention_on = "evac")
+#View(results_list_to_dat(belief_evac))
+dat_belief_evac <- get_best_beliefs(belief_evac)
+
+dat_belief_stay$group <- "stay"
+dat_belief_evac$group <- "evac"
+dat_belief <- rbind(dat_belief_stay,dat_belief_evac)
+
+dat_belief_peak <- data.frame(
+  peak = c(which.max(dat_belief$prob[dat_belief$time == "Time = 1" & dat_belief$group == "evac"]),
+           which.max(dat_belief$prob[dat_belief$time == "Time = 2" & dat_belief$group == "evac"]),
+           which.max(dat_belief$prob[dat_belief$time == "Time = 3" & dat_belief$group == "evac"]),
+           which.max(dat_belief$prob[dat_belief$time == "Time = 4" & dat_belief$group == "evac"]),
+           which.max(dat_belief$prob[dat_belief$time == "Time = 1" & dat_belief$group == "stay"]),
+           which.max(dat_belief$prob[dat_belief$time == "Time = 2" & dat_belief$group == "stay"]),
+           which.max(dat_belief$prob[dat_belief$time == "Time = 3" & dat_belief$group == "stay"]),
+           which.max(dat_belief$prob[dat_belief$time == "Time = 4" & dat_belief$group == "stay"])),
+  prob = c(max(dat_belief$prob[dat_belief$time == "Time = 1" & dat_belief$group == "evac"]),
+           max(dat_belief$prob[dat_belief$time == "Time = 2" & dat_belief$group == "evac"]),
+           max(dat_belief$prob[dat_belief$time == "Time = 3" & dat_belief$group == "evac"]),
+           max(dat_belief$prob[dat_belief$time == "Time = 4" & dat_belief$group == "evac"]),
+           max(dat_belief$prob[dat_belief$time == "Time = 1" & dat_belief$group == "stay"]),
+           max(dat_belief$prob[dat_belief$time == "Time = 2" & dat_belief$group == "stay"]),
+           max(dat_belief$prob[dat_belief$time == "Time = 3" & dat_belief$group == "stay"]),
+           max(dat_belief$prob[dat_belief$time == "Time = 4" & dat_belief$group == "stay"])),
+  group = rep(c("evac","stay"), each = 4),
+  time  = rep(c("Time = 1", "Time = 2","Time = 3","Time = 4"), 2)
+)
+
+#ggplot(dat_belief, aes(x = outcome, y = prob, group = group, color = group)) + geom_point(aes(shape = group)) + geom_line(aes(linetype = group))  + facet_wrap(~time, nrow= 1) + theme(legend.position = "bottom")
+
+#ggplot(dat_belief, aes(x = outcome, y = prob, group = group, color = group)) + geom_point(aes(shape = group)) + geom_line(aes(linetype = group)) + coord_flip() + facet_wrap(~time, nrow= 1) + theme(legend.position = "bottom")
+
+
+ggplot(dat_belief, aes(x = outcome, y = prob, group = group, color = group)) + 
+  geom_line(aes(linetype = group)) + coord_flip() + scale_y_reverse() + 
+  scale_x_discrete(limits=factor(c(1:11))) + facet_wrap(~time, nrow= 1) + 
+  theme(legend.position = "bottom") + 
+  geom_point(dat_belief_peak, mapping = aes(x = peak, y = prob, group = group, color = group, shape = group)) +
+  xlab("Hurricane Outcome") + ylab("Probability")
+
+```
+
+### Goals Difference
+
+```{r echo = FALSE, fig.height=4}
+
+reward_sd <- c(0.5,0.2,0.3,0.1,0.4)
+
+get_best_goals <- function(result, reward, width, initial_w, percentage_adj)
+{
+  cur_time <- result[[1]]$time
+  max_v    <- -9999999
+  max_ind  <- 0
+  dat <- data.frame()
+  for(i in 1:length(result))
+  {
+    v_adj_cost <- result[[i]]$V_adj - result[[i]]$cope_cost
+    if(v_adj_cost > max_v)
+    {
+      max_v <- v_adj_cost
+      max_ind <- i
+    }
+    if(i == length(result) || result[[i+1]]$time != cur_time)
+    {
+       ##Calculate reward
+       ind <- result[[max_ind]]$rew_index
+       if(ind == "base") {ind <- 1}
+       adj <- as.numeric(gen_label(width*2+1)[ind])
+       adj_w <- initial_w + (adj)*percentage_adj*initial_w
+       dat_temp <- data.frame( w       = adj_w,
+                               reward  = reward,
+                               time    = result[[max_ind]]$time,
+                               index   = max_ind)
+       dat <- rbind(dat, dat_temp)
+       max_v <- -9999999
+       cur_time <- result[[i]]$time + 1
+    }
+  }
+  return(dat)
+}
+
+adj_perc <- 0.2
+adj_width <- 4
+
+goal_flood_stay <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], 
+                          adj_bel_width =0, adj_reward_target = 3, adj_reward_percentage = adj_perc, adj_reward_width = adj_width, reward_sd = reward_sd,
+                          intention_on = "stay")
+dat_goal_flood_stay <- get_best_goals(goal_flood_stay,"flood",adj_width, reward_list[[1]][3],adj_perc)
+dat_goal_flood_stay$sd <- reward_sd[3]
+
+goal_flood_evac <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], 
+                          adj_bel_width =0, adj_reward_target = 3, adj_reward_percentage = adj_perc, adj_reward_width = adj_width, reward_sd = reward_sd,
+                          intention_on = "evac")
+dat_goal_flood_evac <- get_best_goals(goal_flood_evac,"flood",adj_width,reward_list[[1]][3],adj_perc)
+dat_goal_flood_evac$sd <- reward_sd[3]
+
+####
+seq_temp <- seq(-2,1,0.01)
+dat_to_plot <- data.frame( prob = c(dnorm(seq_temp, mean = dat_goal_flood_stay$w[4], dat_goal_flood_stay$sd[4]), 
+                                    dnorm(seq_temp, mean = dat_goal_flood_evac$w[4], dat_goal_flood_evac$sd[4])),
+                           group = rep(c("stay","evac"), each = length(seq_temp)),
+                           x    = c(seq_temp,seq_temp))
+dat_peak <- data.frame( 
+    x = c(dat_to_plot$x[which.max(dat_to_plot$prob[dat_to_plot$group == "stay"])],
+          dat_to_plot$x[which.max(dat_to_plot$prob[dat_to_plot$group == "evac"])]),
+    prob = c(max(dat_to_plot$prob[dat_to_plot$group == "stay"]),
+          max(dat_to_plot$prob[dat_to_plot$group == "evac"])),
+    group = c("stay","evac"))
+
+g_flood <- ggplot(dat_to_plot, aes(x = x, y=prob, group = group, color = group)) +
+  geom_line(aes(linetype = group)) + ylab("") + xlab("w_flood") + 
+  geom_point(dat_peak, mapping =  aes(x = x, y=prob, group = group, color = group, shape = group)) +
+  theme(legend.position = "None")
+
+################
+adj_perc <- 0.3
+adj_width <- 5
+goal_outage_stay <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], 
+                          adj_bel_width =0, adj_reward_target = 4, adj_reward_percentage = adj_perc, adj_reward_width = adj_width, reward_sd = reward_sd,
+                          intention_on = "stay")
+dat_goal_outage_stay <- get_best_goals(goal_outage_stay,"outage",adj_width,reward_list[[1]][4],adj_perc)
+dat_goal_outage_stay$sd <- reward_sd[4]
+
+
+goal_outage_evac <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], 
+                          adj_bel_width =0, adj_reward_target = 4, adj_reward_percentage = adj_perc, adj_reward_width = adj_width, reward_sd = reward_sd,
+                          intention_on = "evac")
+dat_goal_outage_evac <- get_best_goals(goal_outage_evac,"outage",adj_width,reward_list[[1]][4],adj_perc)
+dat_goal_outage_evac$sd <- reward_sd[4]
+
+####
+seq_temp <- seq(-0.75,0.25,0.01)
+dat_to_plot <- data.frame( prob = c(dnorm(seq_temp, mean = dat_goal_outage_stay$w[4], dat_goal_outage_stay$sd[4]), 
+                                    dnorm(seq_temp, mean = dat_goal_outage_evac$w[4], dat_goal_outage_evac$sd[4])),
+                           group = rep(c("stay","evac"), each = length(seq_temp)),
+                           x    = c(seq_temp,seq_temp))
+dat_peak <- data.frame( 
+    x = c(dat_to_plot$x[which.max(dat_to_plot$prob[dat_to_plot$group == "stay"])],
+          dat_to_plot$x[which.max(dat_to_plot$prob[dat_to_plot$group == "evac"])]),
+    prob = c(max(dat_to_plot$prob[dat_to_plot$group == "stay"]),
+          max(dat_to_plot$prob[dat_to_plot$group == "evac"])),
+    group = c("stay","evac"))
+
+g_outage <- ggplot(dat_to_plot, aes(x = x, y=prob, group = group, color = group)) + 
+  geom_line(aes(linetype = group)) + ylab("")  + xlab("w_outage")+
+  geom_point(dat_peak, mapping =  aes(x = x, y=prob, group = group, color = group, shape = group)) +
+  theme(legend.position = "None")
+
+############
+adj_perc <- 0.1
+adj_width <- 4
+goal_evaccost_stay <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], 
+                          adj_bel_width =0, adj_reward_target = 5, adj_reward_percentage = adj_perc, adj_reward_width = adj_width, reward_sd = reward_sd,
+                          intention_on = "stay")
+dat_goal_evaccost_stay <- get_best_goals(goal_evaccost_stay,"evaccost",adj_width,reward_list[[1]][5],adj_perc)
+dat_goal_evaccost_stay$sd <- reward_sd[5]
+
+
+goal_evaccost_evac <- simulation(priors[[1]],1,4,reward_list[[1]],acc_lists[[1]],evaccost_list[[1]],hurricane_outcomes, obs_list[[1]], 
+                          adj_bel_width =0, adj_reward_target = 5, adj_reward_percentage = 0.1, adj_reward_width = adj_width, reward_sd = reward_sd,
+                          intention_on = "evac")
+dat_goal_evaccost_evac <- get_best_goals(goal_evaccost_evac,"evaccost",adj_width,reward_list[[1]][5],adj_perc)
+dat_goal_evaccost_evac$sd <- reward_sd[5]
+
+####
+seq_temp <- seq(-3,1,0.01)
+dat_to_plot <- data.frame( prob = c(dnorm(seq_temp, mean = dat_goal_evaccost_stay$w[4], dat_goal_evaccost_stay$sd[4]), 
+                                    dnorm(seq_temp, mean = dat_goal_evaccost_evac$w[4], dat_goal_evaccost_evac$sd[4])),
+                           group = rep(c("stay","evac"), each = length(seq_temp)),
+                           x    = c(seq_temp,seq_temp)
+                           )
+dat_peak <- data.frame( 
+    x = c(dat_to_plot$x[which.max(dat_to_plot$prob[dat_to_plot$group == "stay"])],
+          dat_to_plot$x[which.max(dat_to_plot$prob[dat_to_plot$group == "evac"])]),
+    prob = c(max(dat_to_plot$prob[dat_to_plot$group == "stay"]),
+          max(dat_to_plot$prob[dat_to_plot$group == "evac"])),
+    group = c("stay","evac")
+  )
+
+g_evaccost <- ggplot(dat_to_plot, aes(x = x, y=prob, group = group, color = group)) + 
+  geom_line(aes(linetype = group)) + 
+  geom_point(dat_peak, mapping =  aes(x = x, y=prob, group = group, color = group, shape = group)) +
+  ylab("") + xlab("w_evac_cost") + theme(legend.position = "None")
+
+top <- plot_grid(g_flood,g_outage,g_evaccost, nrow = 1)
+legend_b <- get_legend(
+  g_evaccost + theme(legend.position = "bottom")
+)
+#plot_grid(top,legend_b, ncol = 1,rel_heights = c(1, .1))
+
+```
+
+```{r echo = FALSE}
+
+g_flood <- g_flood + coord_flip() + scale_y_reverse() 
+g_outage <- g_outage + ylab("Probability Density") + coord_flip() + scale_y_reverse() 
+g_evaccost <- g_evaccost + coord_flip() + scale_y_reverse()
+
+top <- plot_grid(g_flood,g_outage,g_evaccost, nrow = 1)
+legend_b <- get_legend(
+  g_evaccost + theme(legend.position = "bottom")
+)
+plot_grid(top,legend_b, ncol = 1, rel_heights = c(1, .1))
+
+```
+
+## Other Visualization
+
+### Hurricane outcomes, reward weights and evacuation costs
+
+```{r echo = FALSE, fig.width=14, fig.height = 8}
+
+
+#### Visualize Utility 
+
+outcomes <- data.frame(     
+  outcome_order = c(1:11),
+  stay_bias     = rep(1,11),
+  not_safe_prob = c(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 ,0.8, 0.9, 0.95),
+  flood_depth   = c(0, 0.5,   1, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,  5.0),
+  outage_dur    = c(0,   4,   8,  12,  16,  20,  24,  28,  32,  36,   40),
+  evac_cost     = rep(0,11),
+  category      = c("0.5","1","1","2","2","3","3","3","4","4","4")
+)
+
+kbl(t(outcomes[,c(1,3:5,7)]), caption = "Hurricane Outcome")  %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+evac_costs <- c(100, 200, 400, 600, 5000)
+reward_weights <- gen_reward_weight(w_bias = 3.7, w_not_safe = -4.5, w_flood = -0.5,w_outage = -0.2, w_ev_cost = -1.0)
+visualize_utility(outcomes, evac_costs, reward_weights) + theme(legend.position = "bottom")
+g1 <- visualize_utility(outcomes, evac_costs, reward_weights)  + theme(legend.position="none")
+
+reward_weights <- gen_reward_weight(w_bias = 2.2, w_not_safe = -4.5, w_flood = -0.5,w_outage = -0.2, w_ev_cost = -1.2)
+g2 <- visualize_utility(outcomes, evac_costs, reward_weights)  + theme(legend.position="none")
+
+reward_weights <- gen_reward_weight(w_bias = 3.0, w_not_safe = -4.2, w_flood = -0.5, w_outage = -0.1, w_ev_cost = -1.0)
+g3 <- visualize_utility(outcomes, evac_costs, reward_weights)  + theme(legend.position="none")
+
+reward_weights <- gen_reward_weight(w_bias = 2.7, w_not_safe = -4.5, w_flood = -0.5, w_outage = -0.2, w_ev_cost = -1.0)
+g4 <- visualize_utility(outcomes, evac_costs, reward_weights)  + theme(legend.position="none")
+
+legend_b <- get_legend(
+  g1 +
+    guides(color = guide_legend(nrow = 1)) +
+    theme(legend.position = "bottom")
+)
+
+prow <- plot_grid(g1,g2,g3, g4, ncol = 2)
+plot_grid(prow, legend_b, ncol = 1, rel_heights = c(1,.1))
+
+```
+
+### Accuracy
+
+```{r echo = FALSE, fig.width = 12}
+
+#### Visualize the acc
+
+dat_temp <- data.frame( 
+  prob = c(acc_t1$`4`,acc_t2$`4`,acc_t3$`4`,acc_t4$`4`,acc_t5$`4`,
+           acc_t1$`8`,acc_t2$`8`,acc_t3$`8`,acc_t4$`8`,acc_t5$`8`),
+  predicted_obs = rep(c(1:11),10),
+  true_state = factor(rep(c(4,8),each = 11*5)),
+  sd = factor(rep(rep(c(2,1.5,1,0.75,0.5), each  = 11),2)),
+  true_state_sd = rep(c("4-2","4-1.5","4-1","4-0.75","4-0.5",
+                        "8-2","8-1.5","8-1","8-0.75","8-0.5"),each = 11)
+)
+
+ggplot(dat_temp, aes(x = predicted_obs, y = prob, group = true_state_sd, col = sd)) + geom_point(aes(shape = true_state)) + 
+  geom_line(aes(linetype = true_state)) + ylab("Probability") + xlab("Observation") + 
+  ggtitle("Accuracy =  P(predicted_obs|true_state)")
+
+
+dat_temp <- data.frame( 
+  prob = c(acc_t1_b$`4`,acc_t2_b$`4`,acc_t3_b$`4`,acc_t4_b$`4`,acc_t5_b$`4`,
+           acc_t1_b$`8`,acc_t2_b$`8`,acc_t3_b$`8`,acc_t4_b$`8`,acc_t5_b$`8`),
+  predicted_obs = rep(c(1:11),10),
+  true_state = factor(rep(c(4,8),each = 11*5)),
+  sd = factor(rep(rep(c(2,1.5,1,0.75,0.5), each  = 11),2)),
+  true_state_sd = rep(c("4-2","4-1.5","4-1","4-0.75","4-0.5",
+                        "8-2","8-1.5","8-1","8-0.75","8-0.5"),each = 11)
+)
+
+ggplot(dat_temp, aes(x = predicted_obs, y = prob, group = true_state_sd, col = sd)) + geom_point(aes(shape = true_state)) + 
+  geom_line(aes(linetype = true_state)) + ylab("Probability") + xlab("Observation") + 
+  ggtitle("Accuracy =  P(predicted_obs|true_state): More uncertain on high impact")
+
+
+dat_temp <- data.frame( 
+  prob = c(acc_t1$`6`,acc_t2$`6`,acc_t3$`6`,acc_t4$`6`,acc_t5$`6`),
+  predicted_obs = rep(c(1:11),10),
+  true_state = factor(rep(c(6),each = 11*5)),
+  sd = factor(rep(c(3,2,1.5,1.25,0.75), each  = 11)),
+  true_state_sd = rep(c("6-2","6-1.5","6-1","6-0.75","6-0.5"),each = 11)
+)
+
+ggplot(dat_temp, aes(x = predicted_obs, y = prob, group = true_state_sd, col = sd)) + geom_point(aes(shape = true_state)) + 
+  geom_line(aes(linetype = true_state)) + ylab("Probability") + xlab("Observation") +
+  ggtitle("Accuracy =  P(Observation|true_state)")
+
+
+```
+
+### Prior
+
+```{r echo = FALSE}
+
+prior_dat <- data.frame( prob =  c(prior2,prior_good,prior_bad),
+                         outcome = rep(c(1:11),3),
+                         prior = rep(c("moderate","toward_good","toward_bad"),each = 11))
+
+ggplot(prior_dat, aes(x = outcome, y = prob, group = prior, color = prior)) + geom_point(aes(shape = prior)) + geom_line(aes(linetype = prior))
+
+
+```
+
+### Cost Visualization
+
+```{r echo = FALSE, fig.width=10}
+
+base1 <- gen_prior(1,11,6,2)
+distt <- c(-5:5)
+dat_temp1 <- data.frame( 
+  distance = distt,
+  cost = c(sapply(distt, function(x) kld(gen_prior(1,11,6,2),
+                                gen_prior(1,11,6+x,2))),
+           sapply(distt, function(x) sd_diff(gen_prior(1,11,6,2),
+                                gen_prior(1,11,6+x,2))),
+           sapply(distt, function(x) 0.5*peak_diff(gen_prior(1,11,6,2),
+                                gen_prior(1,11,6+x,2))**2 )),
+  type = rep(c("KL","sd","mu^2"),each = length(distt)),
+  mu = 6, sd = "sd = 2")
+
+dat_temp2 <- data.frame( 
+  distance = distt,
+  cost = c(sapply(distt, function(x) kld(gen_prior(1,11,6,1.5),
+                                gen_prior(1,11,6+x,1.5))),
+           sapply(distt, function(x) sd_diff(gen_prior(1,11,6,1.5),
+                                gen_prior(1,11,6+x,1.5))),
+           sapply(distt, function(x) 0.5*peak_diff(gen_prior(1,11,6,1.5),
+                                gen_prior(1,11,6+x,1.5))**2)),
+  type = rep(c("KL","sd","mu^2"),each = length(distt)),
+  mu = 6, sd = "sd = 1.5")
+
+dat_temp3 <- data.frame( 
+  distance = distt,
+  cost = c(sapply(distt, function(x) kld(gen_prior(1,11,6,1),
+                                gen_prior(1,11,6+x,1))),
+           sapply(distt, function(x) sd_diff(gen_prior(1,11,6,1),
+                                gen_prior(1,11,6+x,1))),
+           sapply(distt, function(x) 0.5*peak_diff(gen_prior(1,11,6,1),
+                                gen_prior(1,11,6+x,1))**2)),
+  type = rep(c("KL","sd","mu^2"),each = length(distt)),
+  mu = 6, sd = "sd = 1")
+
+dat_temp <- rbind(dat_temp1,dat_temp2,dat_temp3)
+
+ggplot(dat_temp, aes(x = distance, y = cost, group = type, col = type)) + 
+  geom_line(aes(linetype = type)) + geom_point(aes(shape = type)) + 
+  theme(legend.position = "bottom") + facet_wrap(~sd)
+```
+
+
+
+
